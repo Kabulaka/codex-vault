@@ -1,0 +1,44 @@
+{
+  "changes": [
+    {
+      "kind": "created",
+      "plan_version": 1,
+      "reason": "用户确认 Codex Vault MVP 整份设计并授权进入实施",
+      "work_items": [
+        "FEAT-01a08e82-2ef2-761b-abb6-ca0feedfc1f4"
+      ]
+    }
+  ],
+  "plan_version": 1,
+  "requirement_checkpoint": {
+    "commit": "059c1923a2c23f18ddb19a635fff0fe525ec94e4",
+    "path": ".nova/requirements/REQ-01a08e5a-fe60-749a-8bc9-5b1b292e02d6_本地会话整理.md",
+    "sha256": "addafdf0ed32874ee8b06887e1ff33393d6207989790658cd704f1bf29ca1fb1"
+  },
+  "requirement_ref": "REQ-01a08e5a-fe60-749a-8bc9-5b1b292e02d6@v1",
+  "schema": 2,
+  "status": "development",
+  "work_items": [
+    {
+      "blocked_reason": null,
+      "change_reason": "initial-plan",
+      "dependencies": [],
+      "design_ref": ".nova/design/2026-09-11_本地会话整理MVP.md#wp-01-codex-vault-mvp",
+      "done_definition": "Rust 2024 双语 TUI 完成完整交互会话树的安全筛选、预览、归档、恢复和受控删除，操作结果可据实核对并通过最低验收与发布配置验证",
+      "milestones": [
+        {
+          "blocked_reason": null,
+          "done_definition": "实现 MVP 全部设计契约，完成格式、静态检查、单元和集成验收，并形成一个精确范围实现提交",
+          "evidence": [],
+          "id": "M-01",
+          "state": "active",
+          "title": "完整实现并验证 Codex Vault MVP"
+        }
+      ],
+      "state": "active",
+      "supersedes": [],
+      "title": "Codex Vault 本地会话整理 MVP",
+      "work_item": "FEAT-01a08e82-2ef2-761b-abb6-ca0feedfc1f4"
+    }
+  ]
+}
