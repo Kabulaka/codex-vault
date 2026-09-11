@@ -7,20 +7,20 @@
 
 | 门禁 | 是否需要 | 状态 | 确认依据 |
 |------|----------|------|-------------|
-| 共享工程骨架 | 是 | 已确认 | ARCH-01a08e78-c219-744a-a8d6-aa1c76a9baf4 |
-| 数据所有权与契约 | 是 | 已确认 | ARCH-01a08e78-c219-744a-a8d6-aa1c76a9baf4 |
+| 共享工程骨架 | 是 | 已确认 | ARCH-01a08f89-e4fd-7a5b-9c4d-892964112fe7 |
+| 数据所有权与契约 | 是 | 已确认 | ARCH-01a08f89-e4fd-7a5b-9c4d-892964112fe7 |
 | 公共 API 契约 | 否 | 不适用 | 无 |
-| 事件契约 | 是 | 已确认 | ARCH-01a08e78-c219-744a-a8d6-aa1c76a9baf4 |
-| Mock 与测试夹具 | 是 | 已确认 | ARCH-01a08e78-c219-744a-a8d6-aa1c76a9baf4 |
+| 事件契约 | 是 | 已确认 | ARCH-01a08f89-e4fd-7a5b-9c4d-892964112fe7 |
+| Mock 与测试夹具 | 是 | 已确认 | ARCH-01a08f89-e4fd-7a5b-9c4d-892964112fe7 |
 
 ## 2. 契约索引
 
 | 契约类型 | 业务范围 | 路径 | 状态 | 所有者 |
 |----------|----------|------|------|--------|
-| 工程骨架 | 全项目 | [工程骨架契约](foundation/project-skeleton.md) | 已确认 | 架构负责人 |
-| 数据 | 本地会话整理 | [本地数据契约](data/local-session-data.md) | 已确认 | 本地会话整理模块 |
-| 事件 | Codex 会话协议子集 | [app-server 协议子集](events/app-server-subset.yaml) | 已确认 | Codex 接入模块 |
-| Mock | Codex 会话协议子集 | [app-server 场景夹具](mocks/app-server-scenarios.json) | 已确认 | Codex 接入模块 |
+| 工程骨架 | 全项目与 Codex 只读兼容边界 | [工程骨架契约](foundation/project-skeleton.md) | 已确认 | 架构负责人 |
+| 数据 | 本地会话整理与置顶状态兼容视图 | [本地数据契约](data/local-session-data.md) | 已确认 | 本地会话整理模块 |
+| 事件 | Codex 会话协议与置顶状态观测子集 | [app-server 协议子集](events/app-server-subset.yaml) | 已确认 | Codex 接入模块 |
+| Mock | Codex 会话协议与只读状态库场景 | [app-server 场景夹具](mocks/app-server-scenarios.json) | 已确认 | Codex 接入模块 |
 
 ## 3. 硬依赖
 

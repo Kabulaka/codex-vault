@@ -1,6 +1,6 @@
 {
   "_contract": "../events/app-server-subset.yaml",
-  "_contractVersion": "1.0.0",
+  "_contractVersion": "1.1.0",
   "scenarios": [
     {
       "name": "compatible-idle-tree",
@@ -80,6 +80,79 @@
       ],
       "missingNotificationFor": "thr_child_b",
       "expectedRecovery": "relist-and-record-actual-state"
+    },
+    {
+      "name": "pin-filter-ignored-with-read-only-state-fallback",
+      "serverMessages": [
+        {
+          "id": 6,
+          "result": {
+            "data": [
+              {
+                "id": "thr_unpinned",
+                "parentThreadId": null,
+                "recencyAt": 1700000300,
+                "status": { "type": "idle" }
+              },
+              {
+                "id": "thr_pinned",
+                "parentThreadId": null,
+                "recencyAt": 1700000400,
+                "status": { "type": "idle" }
+              }
+            ],
+            "nextCursor": null
+          }
+        }
+      ],
+      "pinFilterProbe": {
+        "trueIds": ["thr_unpinned", "thr_pinned"],
+        "falseIds": ["thr_unpinned", "thr_pinned"]
+      },
+      "stateStore": {
+        "openMode": "read-only",
+        "query": "SELECT id, is_pinned FROM threads",
+        "rows": [
+          ["thr_unpinned", 0],
+          ["thr_pinned", 1]
+        ]
+      },
+      "expectedPinState": {
+        "thr_unpinned": false,
+        "thr_pinned": true
+      }
+    },
+    {
+      "name": "incomplete-read-only-state-fallback",
+      "serverMessages": [
+        {
+          "id": 7,
+          "result": {
+            "data": [
+              {
+                "id": "thr_known",
+                "parentThreadId": null,
+                "recencyAt": 1700000500,
+                "status": { "type": "idle" }
+              },
+              {
+                "id": "thr_missing",
+                "parentThreadId": null,
+                "recencyAt": 1700000600,
+                "status": { "type": "idle" }
+              }
+            ],
+            "nextCursor": null
+          }
+        }
+      ],
+      "stateStore": {
+        "openMode": "read-only",
+        "query": "SELECT id, is_pinned FROM threads",
+        "rows": [["thr_known", 0]]
+      },
+      "expectedMode": "read-only",
+      "unknownPinFor": ["thr_missing"]
     },
     {
       "name": "protocol-error",
