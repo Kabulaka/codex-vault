@@ -1,0 +1,268 @@
+asyncapi: 3.0.0
+info:
+  title: Codex Vault app-server protocol subset
+  version: 1.0.0
+  description: >-
+    Capability-driven JSONL subset used by Codex Vault over a locally owned
+    codex app-server stdio process. Unknown fields are accepted; missing
+    required capabilities disable all write operations.
+defaultContentType: application/json
+channels:
+  clientToServer:
+    address: stdin
+    messages:
+      initializeRequest:
+        $ref: '#/components/messages/InitializeRequest'
+      initializedNotification:
+        $ref: '#/components/messages/InitializedNotification'
+      threadListRequest:
+        $ref: '#/components/messages/ThreadListRequest'
+      threadReadRequest:
+        $ref: '#/components/messages/ThreadReadRequest'
+      threadActionRequest:
+        $ref: '#/components/messages/ThreadActionRequest'
+  serverToClient:
+    address: stdout
+    messages:
+      response:
+        $ref: '#/components/messages/Response'
+      threadNotification:
+        $ref: '#/components/messages/ThreadNotification'
+operations:
+  sendRequests:
+    action: send
+    channel:
+      $ref: '#/channels/clientToServer'
+    messages:
+      - $ref: '#/channels/clientToServer/messages/initializeRequest'
+      - $ref: '#/channels/clientToServer/messages/initializedNotification'
+      - $ref: '#/channels/clientToServer/messages/threadListRequest'
+      - $ref: '#/channels/clientToServer/messages/threadReadRequest'
+      - $ref: '#/channels/clientToServer/messages/threadActionRequest'
+  receiveResponses:
+    action: receive
+    channel:
+      $ref: '#/channels/serverToClient'
+    messages:
+      - $ref: '#/channels/serverToClient/messages/response'
+      - $ref: '#/channels/serverToClient/messages/threadNotification'
+components:
+  messages:
+    InitializeRequest:
+      payload:
+        $ref: '#/components/schemas/InitializeRequest'
+    InitializedNotification:
+      payload:
+        $ref: '#/components/schemas/InitializedNotification'
+    ThreadListRequest:
+      payload:
+        $ref: '#/components/schemas/ThreadListRequest'
+    ThreadReadRequest:
+      payload:
+        $ref: '#/components/schemas/ThreadReadRequest'
+    ThreadActionRequest:
+      payload:
+        $ref: '#/components/schemas/ThreadActionRequest'
+    Response:
+      payload:
+        $ref: '#/components/schemas/Response'
+    ThreadNotification:
+      payload:
+        $ref: '#/components/schemas/ThreadNotification'
+  schemas:
+    RequestEnvelope:
+      type: object
+      required: [method, id, params]
+      properties:
+        method:
+          type: string
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+        params:
+          type: object
+      additionalProperties: true
+    InitializeRequest:
+      allOf:
+        - $ref: '#/components/schemas/RequestEnvelope'
+        - type: object
+          properties:
+            method:
+              const: initialize
+            params:
+              type: object
+              required: [clientInfo]
+              properties:
+                clientInfo:
+                  type: object
+                  required: [name, title, version]
+                  properties:
+                    name:
+                      const: codex_vault
+                    title:
+                      const: Codex Vault
+                    version:
+                      type: string
+                capabilities:
+                  type: object
+                  properties:
+                    experimentalApi:
+                      type: boolean
+                  additionalProperties: true
+              additionalProperties: true
+    InitializedNotification:
+      type: object
+      required: [method, params]
+      properties:
+        method:
+          const: initialized
+        params:
+          type: object
+      additionalProperties: true
+    ThreadListRequest:
+      allOf:
+        - $ref: '#/components/schemas/RequestEnvelope'
+        - type: object
+          properties:
+            method:
+              const: thread/list
+            params:
+              type: object
+              properties:
+                cursor:
+                  type: [string, 'null']
+                limit:
+                  type: integer
+                  minimum: 1
+                sortKey:
+                  enum: [created_at, updated_at, recency_at]
+                sortDirection:
+                  enum: [asc, desc]
+                archived:
+                  type: boolean
+                isPinned:
+                  type: boolean
+                cwd:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items:
+                        type: string
+                searchTerm:
+                  type: string
+                parentThreadId:
+                  type: string
+                ancestorThreadId:
+                  type: string
+              additionalProperties: true
+    ThreadReadRequest:
+      allOf:
+        - $ref: '#/components/schemas/RequestEnvelope'
+        - type: object
+          properties:
+            method:
+              const: thread/read
+            params:
+              type: object
+              required: [threadId, includeTurns]
+              properties:
+                threadId:
+                  type: string
+                  minLength: 1
+                includeTurns:
+                  const: false
+              additionalProperties: true
+    ThreadActionRequest:
+      allOf:
+        - $ref: '#/components/schemas/RequestEnvelope'
+        - type: object
+          properties:
+            method:
+              enum: [thread/archive, thread/unarchive, thread/delete]
+            params:
+              type: object
+              required: [threadId]
+              properties:
+                threadId:
+                  type: string
+                  minLength: 1
+              additionalProperties: true
+    Response:
+      type: object
+      required: [id]
+      properties:
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+        result:
+          type: object
+        error:
+          type: object
+          required: [message]
+          properties:
+            code:
+              type: integer
+            message:
+              type: string
+          additionalProperties: true
+      additionalProperties: true
+    RuntimeStatus:
+      type: object
+      required: [type]
+      properties:
+        type:
+          enum: [notLoaded, idle, systemError, active]
+        activeFlags:
+          type: array
+          items:
+            type: string
+      additionalProperties: true
+    ThreadSummary:
+      type: object
+      required: [id, status]
+      properties:
+        id:
+          type: string
+          minLength: 1
+        name:
+          type: [string, 'null']
+        title:
+          type: [string, 'null']
+        cwd:
+          type: [string, 'null']
+        createdAt:
+          type: [integer, string]
+        updatedAt:
+          type: [integer, string, 'null']
+        recencyAt:
+          type: [integer, string, 'null']
+        isPinned:
+          type: [boolean, 'null']
+        parentThreadId:
+          type: [string, 'null']
+        status:
+          $ref: '#/components/schemas/RuntimeStatus'
+      additionalProperties: true
+    ThreadNotification:
+      type: object
+      required: [method, params]
+      properties:
+        method:
+          enum:
+            - thread/status/changed
+            - thread/archived
+            - thread/unarchived
+            - thread/deleted
+        params:
+          type: object
+          required: [threadId]
+          properties:
+            threadId:
+              type: string
+              minLength: 1
+            status:
+              $ref: '#/components/schemas/RuntimeStatus'
+          additionalProperties: true
+      additionalProperties: true

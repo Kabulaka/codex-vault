@@ -1,0 +1,98 @@
+{
+  "_contract": "../events/app-server-subset.yaml",
+  "_contractVersion": "1.0.0",
+  "scenarios": [
+    {
+      "name": "compatible-idle-tree",
+      "serverMessages": [
+        {
+          "id": 1,
+          "result": {
+            "platformFamily": "unix",
+            "platformOs": "linux",
+            "futureField": "ignored"
+          }
+        },
+        {
+          "id": 2,
+          "result": {
+            "data": [
+              {
+                "id": "thr_root",
+                "title": "Example root",
+                "cwd": "/workspace/example",
+                "recencyAt": 1700000000,
+                "isPinned": false,
+                "parentThreadId": null,
+                "status": { "type": "idle" }
+              },
+              {
+                "id": "thr_child",
+                "title": "Example child",
+                "cwd": "/workspace/example",
+                "recencyAt": 1700000100,
+                "isPinned": false,
+                "parentThreadId": "thr_root",
+                "status": { "type": "notLoaded" }
+              }
+            ],
+            "nextCursor": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "protected-active-descendant",
+      "serverMessages": [
+        {
+          "id": 3,
+          "result": {
+            "data": [
+              {
+                "id": "thr_child_active",
+                "parentThreadId": "thr_root",
+                "recencyAt": 1700000200,
+                "isPinned": false,
+                "status": {
+                  "type": "active",
+                  "activeFlags": ["waitingOnApproval"]
+                }
+              }
+            ],
+            "nextCursor": null
+          }
+        }
+      ],
+      "expectedEligibility": "blocked"
+    },
+    {
+      "name": "partial-descendant-archive",
+      "serverMessages": [
+        { "id": 4, "result": {} },
+        {
+          "method": "thread/archived",
+          "params": { "threadId": "thr_root" }
+        },
+        {
+          "method": "thread/archived",
+          "params": { "threadId": "thr_child_a" }
+        }
+      ],
+      "missingNotificationFor": "thr_child_b",
+      "expectedRecovery": "relist-and-record-actual-state"
+    },
+    {
+      "name": "protocol-error",
+      "serverMessages": [
+        {
+          "id": 5,
+          "error": {
+            "code": -32601,
+            "message": "experimental method unavailable"
+          }
+        }
+      ],
+      "expectedMode": "read-only"
+    }
+  ]
+}
