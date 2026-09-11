@@ -7,9 +7,17 @@
       "work_items": [
         "FEAT-01a08e82-2ef2-761b-abb6-ca0feedfc1f4"
       ]
+    },
+    {
+      "kind": "activated",
+      "plan_version": 2,
+      "reason": "用户确认分阶段 TUI、安全全选、置顶状态只读兼容与可见选择反馈设计，进入完整实现",
+      "work_items": [
+        "FEAT-01a08e82-2ef2-761b-abb6-ca0feedfc1f4"
+      ]
     }
   ],
-  "plan_version": 1,
+  "plan_version": 2,
   "requirement_checkpoint": {
     "commit": "059c1923a2c23f18ddb19a635fff0fe525ec94e4",
     "path": ".nova/requirements/REQ-01a08e5a-fe60-749a-8bc9-5b1b292e02d6_本地会话整理.md",
@@ -21,10 +29,10 @@
   "work_items": [
     {
       "blocked_reason": null,
-      "change_reason": "initial-plan",
+      "change_reason": "user-confirmed-tui-and-pin-state-design",
       "dependencies": [],
       "design_ref": ".nova/design/2026-09-11_本地会话整理MVP.md#wp-01-codex-vault-mvp",
-      "done_definition": "Rust 2024 双语 TUI 完成完整交互会话树的安全筛选、预览、归档、恢复和受控删除，操作结果可据实核对并通过最低验收与发布配置验证",
+      "done_definition": "Rust 2024 双语分阶段 TUI 完成完整交互会话树的直观筛选、安全批量选择、预览、归档、恢复和受控删除，操作结果可据实核对并通过最低验收与发布配置验证",
       "milestones": [
         {
           "blocked_reason": null,
