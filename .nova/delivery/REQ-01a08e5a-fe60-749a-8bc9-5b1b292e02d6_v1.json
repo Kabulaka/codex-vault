@@ -15,9 +15,17 @@
       "work_items": [
         "FEAT-01a08e82-2ef2-761b-abb6-ca0feedfc1f4"
       ]
+    },
+    {
+      "kind": "review-submitted",
+      "plan_version": 3,
+      "reason": "置顶状态只读兼容、可见全选和真实 TUI 验收已完成并形成唯一实现提交，进入待 Review",
+      "work_items": [
+        "FEAT-01a08e82-2ef2-761b-abb6-ca0feedfc1f4"
+      ]
     }
   ],
-  "plan_version": 2,
+  "plan_version": 3,
   "requirement_checkpoint": {
     "commit": "059c1923a2c23f18ddb19a635fff0fe525ec94e4",
     "path": ".nova/requirements/REQ-01a08e5a-fe60-749a-8bc9-5b1b292e02d6_本地会话整理.md",
@@ -29,7 +37,7 @@
   "work_items": [
     {
       "blocked_reason": null,
-      "change_reason": "user-confirmed-tui-and-pin-state-design",
+      "change_reason": "review-submitted",
       "dependencies": [],
       "design_ref": ".nova/design/2026-09-11_本地会话整理MVP.md#wp-01-codex-vault-mvp",
       "done_definition": "Rust 2024 双语分阶段 TUI 完成完整交互会话树的直观筛选、安全批量选择、预览、归档、恢复和受控删除，操作结果可据实核对并通过最低验收与发布配置验证",
@@ -37,13 +45,15 @@
         {
           "blocked_reason": null,
           "done_definition": "实现 MVP 全部设计契约，完成格式、静态检查、单元和集成验收，并形成一个精确范围实现提交",
-          "evidence": [],
+          "evidence": [
+            "3f94ae96f8f6b4e1181767c2ee0edbed05d54e78"
+          ],
           "id": "M-01",
-          "state": "active",
+          "state": "completed",
           "title": "完整实现并验证 Codex Vault MVP"
         }
       ],
-      "state": "active",
+      "state": "review_pending",
       "supersedes": [],
       "title": "Codex Vault 本地会话整理 MVP",
       "work_item": "FEAT-01a08e82-2ef2-761b-abb6-ca0feedfc1f4"
