@@ -23,8 +23,11 @@ proven complete, Codex Vault stays read-only.
 
 Pinned-state handling is also capability-driven. Some Codex app-server builds
 accept the `isPinned` filter but do not return pin metadata and ignore that
-filter. Codex Vault detects overlapping true/false results and deliberately
-stays read-only instead of treating an unknown pin state as safe.
+filter. Codex Vault first stays read-only, then may query only
+`threads(id, is_pinned)` from the newest versioned Codex state database in
+read-only mode. Write access is restored only when that schema, every value,
+and every app-server-scanned ID agree. Codex Vault never writes that database
+or reads message content or any other internal column.
 
 ## Install and run
 
@@ -61,12 +64,15 @@ There is intentionally no unattended write mode.
    `Space` 只切换当前树。切换动作或修改筛选会自动清空选择。
 4. 在“预览”核对树数和准确节点数，再按 `Enter` 执行。永久删除还必须输入
    屏幕显示的准确节点数。
-5. 在“结果”查看成功、失败、跳过和中断数量以及逐项结果。
+5. 在“结果”查看成功、失败、跳过和中断数量以及逐项结果；结果超过一屏时使用
+   `↑/↓` 滚动。
 
 “缺少 app-server 写入能力”不是等待一段时间后自动获得的权限，而是当前 Codex
 `app-server` 没有暴露工具所需的完整能力。此时 Codex Vault 会保持只读；升级到提供
-完整关系、置顶状态和写入接口的官方 Codex 版本并重新扫描后，才会自动恢复可操作状态。
-工具不会直接修改 Codex 数据库来绕过此限制。
+完整关系与写入接口的官方 Codex 版本并重新扫描后，才会自动恢复可操作状态。若仅
+`isPinned` 投影不可靠，工具会先保持只读，再只读查询最新状态库的
+`threads(id, is_pinned)`；只有模式、值和全部扫描 ID 完整一致时才解除该限制。工具
+绝不修改 Codex 数据库，也不读取正文或其他内部列。
 
 ## Keyboard
 

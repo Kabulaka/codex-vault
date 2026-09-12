@@ -104,6 +104,7 @@ pub enum SessionSource {
     Cli,
     Vscode,
     Exec,
+    AppServer,
     Descendant,
     Other(String),
     Unknown,
@@ -112,6 +113,10 @@ pub enum SessionSource {
 impl SessionSource {
     pub fn is_interactive_root(&self) -> bool {
         matches!(self, Self::Cli | Self::Vscode)
+    }
+
+    pub fn is_known(&self) -> bool {
+        !matches!(self, Self::Other(_) | Self::Unknown)
     }
 }
 
@@ -232,19 +237,50 @@ impl SessionTree {
     }
 
     pub fn impacted_ids(&self, action: Action) -> Vec<String> {
-        let mut nodes = self.nodes.clone();
-        nodes.sort_by_key(|node| depth(node, &self.nodes));
+        let mut children = BTreeMap::<&str, Vec<&SessionNode>>::new();
+        let mut roots = Vec::new();
+        for node in &self.nodes {
+            if let Some(parent) = node.parent_id.as_deref() {
+                children.entry(parent).or_default().push(node);
+            } else {
+                roots.push(node);
+            }
+        }
+        let mut depths = BTreeMap::<&str, usize>::new();
+        let mut stack = roots
+            .into_iter()
+            .map(|node| (node, 0usize))
+            .collect::<Vec<_>>();
+        while let Some((node, depth)) = stack.pop() {
+            if depths.insert(node.id.as_str(), depth).is_some() {
+                continue;
+            }
+            if let Some(values) = children.get(node.id.as_str()) {
+                stack.extend(values.iter().map(|child| (*child, depth.saturating_add(1))));
+            }
+        }
+        let mut nodes = self
+            .nodes
+            .iter()
+            .map(|node| (depths.get(node.id.as_str()).copied().unwrap_or(0), node))
+            .collect::<Vec<_>>();
+        nodes.sort_by(|(left_depth, left), (right_depth, right)| {
+            left_depth
+                .cmp(right_depth)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         if matches!(action, Action::Archive | Action::Delete) {
             nodes.reverse();
         }
         nodes
             .into_iter()
+            .map(|(_, node)| node)
             .filter(|node| match action {
                 Action::Archive => !node.archived,
                 Action::Restore => node.archived,
                 Action::Delete => node.archived,
             })
-            .map(|node| node.id)
+            .map(|node| node.id.clone())
             .collect()
     }
 
@@ -273,43 +309,36 @@ impl SessionTree {
     }
 }
 
-fn depth(node: &SessionNode, all: &[SessionNode]) -> usize {
-    let by_id = all
-        .iter()
-        .map(|value| (value.id.as_str(), value))
-        .collect::<BTreeMap<_, _>>();
-    let mut current = node.parent_id.as_deref();
-    let mut seen = BTreeSet::new();
-    let mut value = 0;
-    while let Some(parent) = current {
-        if !seen.insert(parent) {
-            break;
-        }
-        value += 1;
-        current = by_id.get(parent).and_then(|item| item.parent_id.as_deref());
-    }
-    value
-}
-
 pub fn build_trees(snapshot: &ScanSnapshot) -> Vec<SessionTree> {
-    let by_id = snapshot
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node))
-        .collect::<BTreeMap<_, _>>();
     let roots = snapshot
         .nodes
         .iter()
-        .filter(|node| node.parent_id.is_none() && node.source.is_interactive_root());
+        .filter(|node| node.parent_id.is_none() && node.source.is_interactive_root())
+        .collect::<Vec<_>>();
+    let mut children = BTreeMap::<&str, Vec<&SessionNode>>::new();
+    for node in &snapshot.nodes {
+        if let Some(parent) = node.parent_id.as_deref() {
+            children.entry(parent).or_default().push(node);
+        }
+    }
+    for values in children.values_mut() {
+        values.sort_by(|left, right| right.id.cmp(&left.id));
+    }
     let mut trees = Vec::new();
 
     for root in roots {
-        let mut nodes = snapshot
-            .nodes
-            .iter()
-            .filter(|candidate| belongs_to_root(candidate, root.id.as_str(), &by_id))
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        let mut stack = vec![root];
+        let mut visited = BTreeSet::new();
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node.id.as_str()) {
+                continue;
+            }
+            nodes.push(node.clone());
+            if let Some(values) = children.get(node.id.as_str()) {
+                stack.extend(values.iter().copied());
+            }
+        }
         nodes.sort_by(|left, right| left.id.cmp(&right.id));
         let last_activity = nodes.iter().filter_map(|node| node.last_activity).max();
         let mut protection = nodes
@@ -331,28 +360,6 @@ pub fn build_trees(snapshot: &ScanSnapshot) -> Vec<SessionTree> {
     }
     trees.sort_by_key(|tree| std::cmp::Reverse(tree.last_activity.unwrap_or(i64::MIN)));
     trees
-}
-
-fn belongs_to_root<'a>(
-    candidate: &'a SessionNode,
-    root: &str,
-    by_id: &BTreeMap<&'a str, &'a SessionNode>,
-) -> bool {
-    if candidate.id == root {
-        return true;
-    }
-    let mut current = candidate.parent_id.as_deref();
-    let mut seen = BTreeSet::new();
-    while let Some(parent) = current {
-        if parent == root {
-            return true;
-        }
-        if !seen.insert(parent) {
-            return false;
-        }
-        current = by_id.get(parent).and_then(|node| node.parent_id.as_deref());
-    }
-    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,21 +442,30 @@ impl Action {
             Self::Delete => "delete",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "archive" => Some(Self::Archive),
+            "restore" => Some(Self::Restore),
+            "delete" => Some(Self::Delete),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedTree {
-    pub root_id: String,
-    pub signature: String,
-    pub node_ids: Vec<String>,
+    pub(crate) root_id: String,
+    pub(crate) signature: String,
+    pub(crate) node_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationPreview {
-    pub action: Action,
-    pub trees: Vec<PlannedTree>,
-    pub impacted_count: usize,
-    pub blocked: Vec<(String, Vec<ProtectionReason>)>,
+    pub(crate) action: Action,
+    pub(crate) trees: Vec<PlannedTree>,
+    pub(crate) impacted_count: usize,
+    pub(crate) blocked: Vec<(String, Vec<ProtectionReason>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,6 +518,13 @@ pub struct HistoryEntry {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBatch {
+    pub batch_id: String,
+    pub action: Action,
+    pub node_ids: Vec<String>,
+}
+
 pub trait SessionGateway {
     fn scan(&mut self) -> PortFuture<'_, ScanSnapshot>;
     fn mutate<'a>(&'a mut self, action: Action, thread_id: &'a str) -> PortFuture<'a, MutationAck>;
@@ -513,20 +536,19 @@ pub trait OperationStore {
     fn save_preferences(&mut self, value: &Preferences) -> Result<(), VaultError>;
     fn begin_batch(
         &mut self,
-        batch_id: &str,
+        plan_key: &str,
         action: Action,
         created_at: i64,
         node_ids: &[String],
-    ) -> Result<(), VaultError>;
-    fn record_result(
+    ) -> Result<String, VaultError>;
+    fn complete_batch(
         &mut self,
         batch_id: &str,
-        node_id: &str,
-        result: &ItemResult,
+        results: &BTreeMap<String, ItemResult>,
+        status: &str,
         completed_at: i64,
     ) -> Result<(), VaultError>;
-    fn finish_batch(&mut self, batch_id: &str, status: &str) -> Result<(), VaultError>;
-    fn recover_interrupted(&mut self) -> Result<usize, VaultError>;
+    fn pending_batches(&self) -> Result<Vec<PendingBatch>, VaultError>;
     fn prune(&mut self, now: i64, retention_days: u32) -> Result<usize, VaultError>;
     fn history(&self, limit: usize) -> Result<Vec<HistoryEntry>, VaultError>;
 }
@@ -611,6 +633,43 @@ mod tests {
             protection: vec![],
         };
         assert_eq!(tree.impacted_ids(Action::Archive), vec!["child", "root"]);
+    }
+
+    #[test]
+    fn thousands_of_roots_and_a_deep_tree_are_built_iteratively() {
+        let many_roots = ScanSnapshot {
+            nodes: (0..5_000)
+                .map(|index| node(&format!("root-{index}"), None, SessionSource::Cli, false))
+                .collect(),
+            write_capable: true,
+            relation_complete: true,
+            diagnostics: vec![],
+        };
+        let trees = build_trees(&many_roots);
+        assert_eq!(trees.len(), 5_000);
+        assert!(trees.iter().all(|tree| tree.nodes.len() == 1));
+
+        let mut nodes = Vec::with_capacity(5_000);
+        nodes.push(node("node-0", None, SessionSource::Cli, false));
+        for index in 1..5_000 {
+            nodes.push(node(
+                &format!("node-{index}"),
+                Some(&format!("node-{}", index - 1)),
+                SessionSource::Descendant,
+                false,
+            ));
+        }
+        let mut deep = build_trees(&ScanSnapshot {
+            nodes,
+            write_capable: true,
+            relation_complete: true,
+            diagnostics: vec![],
+        });
+        assert_eq!(deep.len(), 1);
+        let impacted = deep.remove(0).impacted_ids(Action::Archive);
+        assert_eq!(impacted.len(), 5_000);
+        assert_eq!(impacted.first().map(String::as_str), Some("node-4999"));
+        assert_eq!(impacted.last().map(String::as_str), Some("node-0"));
     }
 
     #[test]

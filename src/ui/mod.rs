@@ -64,6 +64,7 @@ struct UiState {
     message: String,
     history: Vec<HistoryEntry>,
     result: Vec<String>,
+    result_offset: usize,
 }
 
 impl UiState {
@@ -88,6 +89,7 @@ impl UiState {
             message: String::new(),
             history: Vec::new(),
             result: Vec::new(),
+            result_offset: 0,
         }
     }
 
@@ -141,7 +143,13 @@ where
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        if handle_key(key, &mut state, service).await? {
+        let area = terminal
+            .size()
+            .map_err(|error| VaultError::Unavailable(error.to_string()))?;
+        if !event_allowed(area.width, area.height, key) {
+            continue;
+        }
+        if handle_key(key, area.height, &mut state, service).await? {
             break;
         }
     }
@@ -152,6 +160,7 @@ where
 
 async fn handle_key<G, S>(
     key: KeyEvent,
+    terminal_height: u16,
     state: &mut UiState,
     service: &mut VaultService<G, S>,
 ) -> Result<bool, VaultError>
@@ -164,6 +173,15 @@ where
     }
     if matches!(state.screen, Screen::Search | Screen::CustomCutoff) {
         return handle_text_input(key, state, service).await;
+    }
+    if key.code == KeyCode::Char('l') {
+        let language = match state.catalog.language() {
+            crate::domain::Language::En => crate::domain::Language::ZhCn,
+            crate::domain::Language::ZhCn => crate::domain::Language::En,
+        };
+        state.catalog = Catalog::new(language);
+        persist_preferences(state, service);
+        return Ok(false);
     }
     if key.code == KeyCode::Char('?') {
         if state.screen != Screen::Help {
@@ -181,8 +199,13 @@ where
     }
     if key.code == KeyCode::Char('h') && !matches!(state.screen, Screen::History | Screen::Help) {
         state.return_screen = state.screen;
-        state.history = service.history(50).unwrap_or_default();
-        state.screen = Screen::History;
+        match service.history(50) {
+            Ok(history) => {
+                state.history = history;
+                state.screen = Screen::History;
+            }
+            Err(error) => state.message = error.to_string(),
+        }
         return Ok(false);
     }
 
@@ -192,10 +215,25 @@ where
         Screen::Select => handle_select(key, state, service),
         Screen::Preview => handle_preview(key, state, service).await,
         Screen::Result => {
-            if key.code == KeyCode::Enter {
-                state.screen = Screen::Scan;
-                state.action = None;
-                state.preview = None;
+            let max_start = state
+                .result
+                .len()
+                .saturating_sub(result_view_height(terminal_height));
+            state.result_offset = state.result_offset.min(max_start);
+            match key.code {
+                KeyCode::Up => {
+                    state.result_offset = state.result_offset.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    state.result_offset = state.result_offset.saturating_add(1).min(max_start);
+                }
+                KeyCode::Enter => {
+                    state.screen = Screen::Scan;
+                    state.action = None;
+                    state.preview = None;
+                    state.result_offset = 0;
+                }
+                _ => {}
             }
         }
         Screen::History | Screen::Help => {
@@ -280,14 +318,6 @@ where
                 Some(true) => None,
             };
             state.reset_selection();
-            persist_preferences(state, service);
-        }
-        KeyCode::Char('l') => {
-            let language = match state.catalog.language() {
-                crate::domain::Language::En => crate::domain::Language::ZhCn,
-                crate::domain::Language::ZhCn => crate::domain::Language::En,
-            };
-            state.catalog = Catalog::new(language);
             persist_preferences(state, service);
         }
         KeyCode::Char('r') => {
@@ -439,6 +469,7 @@ async fn execute_preview<G, S>(
     S: OperationStore,
 {
     state.result.clear();
+    state.result_offset = 0;
     match service.execute(&preview, confirmation).await {
         Ok(result) => {
             let success = result
@@ -587,17 +618,18 @@ fn summarize_scope(
     preview: OperationPreview,
     action: Action,
 ) -> ScopeSummary {
+    let candidates = trees
+        .iter()
+        .filter(|tree| action_candidate(tree, action))
+        .map(|tree| tree.root_id.as_str())
+        .collect::<BTreeSet<_>>();
     let mut summary = ScopeSummary {
         matched: trees.len(),
         blocked: preview.blocked.into_iter().collect(),
         ..ScopeSummary::default()
     };
     for planned in preview.trees {
-        let candidate = trees
-            .iter()
-            .find(|tree| tree.root_id == planned.root_id)
-            .is_some_and(|tree| action_candidate(tree, action));
-        if candidate && !planned.node_ids.is_empty() {
+        if candidates.contains(planned.root_id.as_str()) && !planned.node_ids.is_empty() {
             summary.impacted += planned.node_ids.len();
             summary.eligible.insert(planned.root_id);
         }
@@ -725,11 +757,14 @@ where
             Constraint::Length(5),
         ])
         .split(frame.area());
-    draw_header(frame, areas[0], state, service);
+    let scope = state
+        .action
+        .map(|action| scope_summary(service, &state.filter, action));
+    draw_header(frame, areas[0], state, service, scope.as_ref());
     match state.screen {
         Screen::Scan => draw_scan(frame, areas[1], state, service),
         Screen::Filter => draw_filter(frame, areas[1], state, service),
-        Screen::Select => draw_select(frame, areas[1], state, service),
+        Screen::Select => draw_select(frame, areas[1], state, service, scope.as_ref()),
         Screen::Preview => draw_preview(frame, areas[1], state, service),
         Screen::Result => draw_result(frame, areas[1], state),
         Screen::History => draw_history(frame, areas[1], state),
@@ -739,8 +774,13 @@ where
     draw_footer(frame, areas[2], state, service);
 }
 
-fn draw_header<G, S>(frame: &mut Frame, area: Rect, state: &UiState, service: &VaultService<G, S>)
-where
+fn draw_header<G, S>(
+    frame: &mut Frame,
+    area: Rect,
+    state: &UiState,
+    service: &VaultService<G, S>,
+    scope: Option<&ScopeSummary>,
+) where
     G: SessionGateway,
     S: OperationStore,
 {
@@ -778,9 +818,11 @@ where
         }
     }
     let matched = service.filtered(&state.filter).len();
-    let (eligible, blocked, impacted) = state.action.map_or((0, 0, 0), |action| {
-        let scope = scope_summary(service, &state.filter, action);
-        let selected_impacted = service.preview(&state.selected, action).impacted_count;
+    let (eligible, blocked, impacted) = scope.map_or((0, 0, 0), |scope| {
+        let selected_impacted = state
+            .action
+            .map(|action| service.preview(&state.selected, action).impacted_count)
+            .unwrap_or_default();
         (
             scope.eligible.len(),
             scope.matched.saturating_sub(scope.eligible.len()),
@@ -928,8 +970,13 @@ where
     );
 }
 
-fn draw_select<G, S>(frame: &mut Frame, area: Rect, state: &UiState, service: &VaultService<G, S>)
-where
+fn draw_select<G, S>(
+    frame: &mut Frame,
+    area: Rect,
+    state: &UiState,
+    service: &VaultService<G, S>,
+    scope: Option<&ScopeSummary>,
+) where
     G: SessionGateway,
     S: OperationStore,
 {
@@ -945,9 +992,6 @@ where
         );
         return;
     }
-    let scope = state
-        .action
-        .map(|action| scope_summary(service, &state.filter, action));
     let visible = area.height.saturating_sub(2) as usize;
     let index = clamp_index(state.index, trees.len());
     let start = window_start(index, trees.len(), visible);
@@ -960,10 +1004,8 @@ where
         .map(|(position, tree)| {
             let selected = selection_marker(&state.selected, &tree.root_id);
             let marker = if position == index { "›" } else { " " };
-            let eligible = scope
-                .as_ref()
-                .is_some_and(|value| value.eligible.contains(&tree.root_id));
-            let reason = match (state.action, scope.as_ref()) {
+            let eligible = scope.is_some_and(|value| value.eligible.contains(&tree.root_id));
+            let reason = match (state.action, scope) {
                 (Some(action), Some(scope)) if !eligible => {
                     row_blocked_message(&state.catalog, tree, action, scope)
                 }
@@ -1051,83 +1093,91 @@ where
     let Some(preview) = &state.preview else {
         return;
     };
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!(
-                "{} · {}={} · {}={}",
-                action_text(&state.catalog, preview.action),
-                state.catalog.text("trees"),
-                preview.trees.len(),
-                state.catalog.text("impacted"),
-                preview.impacted_count
-            ),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!(
-            "{}: {} · {}: {} · {}: {}",
-            state.catalog.text("cutoff"),
-            cutoff_text(&state.filter.cutoff),
-            state.catalog.text("view"),
-            view_text(&state.catalog, state.filter.archived),
-            state.catalog.text("query"),
-            state.filter.query.as_deref().unwrap_or("*")
-        )),
-        Line::from(""),
-    ];
-    for planned in &preview.trees {
-        let title = service
-            .trees()
-            .iter()
-            .find(|tree| tree.root_id == planned.root_id)
-            .and_then(|tree| tree.nodes.first())
-            .map_or("-", |node| node.title.as_str());
-        lines.push(Line::from(format!(
-            "✓ {} · {} · {}{}",
-            fit_to_width(title, 36),
-            short_id(&planned.root_id),
-            planned.node_ids.len(),
-            state.catalog.text("nodes")
-        )));
-    }
-    for (root, reasons) in &preview.blocked {
-        lines.push(Line::from(format!(
-            "✗ {}: {}",
-            short_id(root),
-            reasons
-                .iter()
-                .map(|reason| protection_text(&state.catalog, reason))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(if preview.action == Action::Delete {
-        format!(
-            "{} {}: {}_",
-            state.catalog.text("delete_confirm_prefix"),
-            preview.impacted_count,
-            state.input
-        )
-    } else {
-        state.catalog.text("confirm").to_owned()
-    }));
     let height = area.height.saturating_sub(2) as usize;
-    let max_start = lines.len().saturating_sub(height);
+    let total = 5usize
+        .saturating_add(preview.trees.len())
+        .saturating_add(preview.blocked.len());
+    let max_start = total.saturating_sub(height);
     let offset = state.preview_offset.min(max_start);
+    let titles = service
+        .trees()
+        .iter()
+        .filter_map(|tree| {
+            tree.nodes
+                .first()
+                .map(|node| (tree.root_id.as_str(), node.title.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let planned_start = 3;
+    let blocked_start = planned_start + preview.trees.len();
+    let blank_index = blocked_start + preview.blocked.len();
+    let confirm_index = blank_index + 1;
+    let lines = (offset..offset.saturating_add(height).min(total))
+        .map(|index| match index {
+            0 => Line::from(Span::styled(
+                format!(
+                    "{} · {}={} · {}={}",
+                    action_text(&state.catalog, preview.action),
+                    state.catalog.text("trees"),
+                    preview.trees.len(),
+                    state.catalog.text("impacted"),
+                    preview.impacted_count
+                ),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            1 => Line::from(format!(
+                "{}: {} · {}: {} · {}: {}",
+                state.catalog.text("cutoff"),
+                cutoff_text(&state.filter.cutoff),
+                state.catalog.text("view"),
+                view_text(&state.catalog, state.filter.archived),
+                state.catalog.text("query"),
+                state.filter.query.as_deref().unwrap_or("*")
+            )),
+            2 => Line::from(""),
+            value if value < blocked_start => {
+                let planned = &preview.trees[value - planned_start];
+                let title = titles.get(planned.root_id.as_str()).copied().unwrap_or("-");
+                Line::from(format!(
+                    "✓ {} · {} · {}{}",
+                    fit_to_width(title, 36),
+                    short_id(&planned.root_id),
+                    planned.node_ids.len(),
+                    state.catalog.text("nodes")
+                ))
+            }
+            value if value < blank_index => {
+                let (root, reasons) = &preview.blocked[value - blocked_start];
+                Line::from(format!(
+                    "✗ {}: {}",
+                    short_id(root),
+                    reasons
+                        .iter()
+                        .map(|reason| protection_text(&state.catalog, reason))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            }
+            value if value == blank_index => Line::from(""),
+            value if value == confirm_index && preview.action == Action::Delete => {
+                Line::from(format!(
+                    "{} {}: {}_",
+                    state.catalog.text("delete_confirm_prefix"),
+                    preview.impacted_count,
+                    state.input
+                ))
+            }
+            _ => Line::from(state.catalog.text("confirm")),
+        })
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(
-            lines
-                .into_iter()
-                .skip(offset)
-                .take(height)
-                .collect::<Vec<_>>(),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(state.catalog.text("step_preview")),
-        )
-        .wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(state.catalog.text("step_preview")),
+            )
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -1161,14 +1211,30 @@ fn draw_history(frame: &mut Frame, area: Rect, state: &UiState) {
 }
 
 fn draw_result(frame: &mut Frame, area: Rect, state: &UiState) {
+    let height = area.height.saturating_sub(2) as usize;
+    let max_start = state.result.len().saturating_sub(height);
+    let offset = state.result_offset.min(max_start);
     frame.render_widget(
-        Paragraph::new(state.result.join("\n"))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(state.catalog.text("step_result")),
-            )
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(
+            state
+                .result
+                .iter()
+                .skip(offset)
+                .take(height)
+                .map(|value| Line::from(value.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "{} · {}/{}",
+            state.catalog.text("step_result"),
+            if state.result.is_empty() {
+                0
+            } else {
+                offset + 1
+            },
+            state.result.len()
+        )))
+        .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -1284,6 +1350,19 @@ fn terminal_too_small(area: Rect) -> bool {
     area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT
 }
 
+fn is_exit_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('q')
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn event_allowed(width: u16, height: u16, key: KeyEvent) -> bool {
+    (width >= MIN_TERMINAL_WIDTH && height >= MIN_TERMINAL_HEIGHT) || is_exit_key(key)
+}
+
+fn result_view_height(terminal_height: u16) -> usize {
+    terminal_height.saturating_sub(5 + 5).saturating_sub(2) as usize
+}
+
 fn clamp_index(index: usize, len: usize) -> usize {
     if len == 0 { 0 } else { index.min(len - 1) }
 }
@@ -1395,7 +1474,8 @@ fn protection_text(catalog: &Catalog, reason: &ProtectionReason) -> String {
 mod tests {
     use super::*;
     use crate::domain::{
-        MutationAck, PortFuture, RuntimeStatus, ScanSnapshot, SessionNode, SessionSource,
+        MutationAck, PendingBatch, PortFuture, RuntimeStatus, ScanSnapshot, SessionNode,
+        SessionSource,
     };
 
     #[derive(Clone)]
@@ -1436,26 +1516,22 @@ mod tests {
             _: Action,
             _: i64,
             _: &[String],
-        ) -> Result<(), VaultError> {
+        ) -> Result<String, VaultError> {
             unreachable!("selection tests never create a batch")
         }
 
-        fn record_result(
+        fn complete_batch(
             &mut self,
             _: &str,
+            _: &BTreeMap<String, ItemResult>,
             _: &str,
-            _: &ItemResult,
             _: i64,
         ) -> Result<(), VaultError> {
             unreachable!("selection tests never record results")
         }
 
-        fn finish_batch(&mut self, _: &str, _: &str) -> Result<(), VaultError> {
-            unreachable!("selection tests never finish a batch")
-        }
-
-        fn recover_interrupted(&mut self) -> Result<usize, VaultError> {
-            Ok(0)
+        fn pending_batches(&self) -> Result<Vec<PendingBatch>, VaultError> {
+            Ok(Vec::new())
         }
 
         fn prune(&mut self, _: i64, _: u32) -> Result<usize, VaultError> {
@@ -1574,9 +1650,20 @@ mod tests {
 
     #[test]
     fn narrow_terminal_has_an_explicit_gate() {
-        assert!(terminal_too_small(Rect::new(0, 0, 79, 30)));
+        let narrow = Rect::new(0, 0, 79, 30);
+        assert!(terminal_too_small(narrow));
         assert!(terminal_too_small(Rect::new(0, 0, 100, 19)));
         assert!(!terminal_too_small(Rect::new(0, 0, 80, 20)));
+        assert!(!event_allowed(
+            narrow.width,
+            narrow.height,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        ));
+        assert!(event_allowed(
+            narrow.width,
+            narrow.height,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+        ));
     }
 
     #[test]
@@ -1657,6 +1744,126 @@ mod tests {
             &service,
         );
         assert_eq!(state.selected.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn result_scroll_reaches_both_ends_and_language_is_global() {
+        let mut service = VaultService::new(
+            Gateway {
+                snapshot: selectable_snapshot(),
+            },
+            Store,
+        );
+        service.refresh().await.unwrap();
+        let mut state = UiState::new(Preferences::default());
+        state.screen = Screen::Result;
+        state.result = (0..30).map(|index| format!("result-{index}")).collect();
+
+        for _ in 0..100 {
+            handle_key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                20,
+                &mut state,
+                &mut service,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(state.result_offset, 22);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &state, &service))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("result-29"));
+
+        handle_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            21,
+            &mut state,
+            &mut service,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.result_offset, 20);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 21)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &state, &service))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("result-20"));
+        assert!(!rendered.contains("result-29"));
+
+        for _ in 0..100 {
+            handle_key(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                20,
+                &mut state,
+                &mut service,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(state.result_offset, 0);
+        let original = state.catalog.language();
+        handle_key(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            20,
+            &mut state,
+            &mut service,
+        )
+        .await
+        .unwrap();
+        assert_ne!(state.catalog.language(), original);
+
+        state.screen = Screen::History;
+        let before_history = state.catalog.language();
+        handle_key(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            20,
+            &mut state,
+            &mut service,
+        )
+        .await
+        .unwrap();
+        assert_ne!(state.catalog.language(), before_history);
+    }
+
+    #[test]
+    fn large_scope_summary_remains_complete() {
+        let trees = (0..5_000)
+            .map(|index| tree(&format!("tree-{index}"), false, vec![]))
+            .collect::<Vec<_>>();
+        let preview = OperationPreview {
+            action: Action::Archive,
+            trees: trees
+                .iter()
+                .map(|tree| crate::domain::PlannedTree {
+                    root_id: tree.root_id.clone(),
+                    signature: tree.signature(),
+                    node_ids: vec![tree.root_id.clone()],
+                })
+                .collect(),
+            impacted_count: trees.len(),
+            blocked: vec![],
+        };
+        let references = trees.iter().collect::<Vec<_>>();
+        let summary = summarize_scope(&references, preview, Action::Archive);
+        assert_eq!(summary.matched, 5_000);
+        assert_eq!(summary.eligible.len(), 5_000);
+        assert_eq!(summary.impacted, 5_000);
     }
 
     #[tokio::test]
