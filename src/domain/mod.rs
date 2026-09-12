@@ -378,18 +378,19 @@ impl Filter {
         if last_activity > self.cutoff.epoch_seconds(now) {
             return false;
         }
-        if let Some(archived) = self.archived
-            && tree.is_fully_archived() != archived
-        {
-            return false;
+        if let Some(archived) = self.archived {
+            if tree.is_fully_archived() != archived {
+                return false;
+            }
         }
-        if let Some(project) = self.project.as_deref()
-            && !tree
+        if let Some(project) = self.project.as_deref() {
+            if !tree
                 .nodes
                 .iter()
                 .any(|node| node.project.as_deref() == Some(project) || node.cwd == project)
-        {
-            return false;
+            {
+                return false;
+            }
         }
         if let Some(query) = self.query.as_deref() {
             if !query.split_whitespace().all(|token| {
@@ -606,6 +607,35 @@ mod tests {
         };
         assert!(filter.matches(&tree, 172_800));
         assert!(!filter.matches(&tree, 172_799));
+    }
+
+    #[test]
+    fn archive_and_project_filters_keep_their_and_semantics() {
+        let tree = SessionTree {
+            root_id: "root".into(),
+            nodes: vec![node("root", None, SessionSource::Cli, true)],
+            last_activity: Some(86_400),
+            protection: vec![],
+        };
+        let matching = Filter {
+            cutoff: Cutoff::RollingDays(1),
+            project: Some("p".into()),
+            query: None,
+            archived: Some(true),
+        };
+        assert!(matching.matches(&tree, 172_800));
+
+        let wrong_archive = Filter {
+            archived: Some(false),
+            ..matching.clone()
+        };
+        assert!(!wrong_archive.matches(&tree, 172_800));
+
+        let wrong_project = Filter {
+            project: Some("other".into()),
+            ..matching
+        };
+        assert!(!wrong_project.matches(&tree, 172_800));
     }
 
     #[test]
