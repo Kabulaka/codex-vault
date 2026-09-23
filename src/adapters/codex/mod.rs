@@ -588,11 +588,11 @@ impl AppServerClient {
                 output.status
             )));
         }
-        if action == Action::Delete
-            && let Some(path) = self.known_rollout_paths.get(thread_id)
-        {
-            self.pending_delete_paths
-                .insert(thread_id.to_owned(), path.clone());
+        if action == Action::Delete {
+            if let Some(path) = self.known_rollout_paths.get(thread_id) {
+                self.pending_delete_paths
+                    .insert(thread_id.to_owned(), path.clone());
+            }
         }
         Ok(MutationAck {
             response_received: true,
@@ -1012,35 +1012,35 @@ impl AppServerClient {
             }
         }
 
-        if catalog.is_none()
-            && let Some(probe_root) = root_ids.first()
-        {
-            let expected = included_ids
-                .iter()
-                .filter(|id| *id != probe_root)
-                .filter(|id| raw_belongs_to_root(id, probe_root, &raw))
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            let mut observed = BTreeSet::new();
-            for archived in [false, true] {
-                match self
-                    .list_all(archived, Some(probe_root), None, true, true)
-                    .await
-                {
-                    Ok(values) => observed.extend(values.into_iter().map(|value| value.id)),
-                    Err(error) => {
-                        relation_complete = false;
-                        diagnostics.push(format!(
-                            "ancestorThreadId unavailable for {probe_root}: {error}"
-                        ));
+        if catalog.is_none() {
+            if let Some(probe_root) = root_ids.first() {
+                let expected = included_ids
+                    .iter()
+                    .filter(|id| *id != probe_root)
+                    .filter(|id| raw_belongs_to_root(id, probe_root, &raw))
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let mut observed = BTreeSet::new();
+                for archived in [false, true] {
+                    match self
+                        .list_all(archived, Some(probe_root), None, true, true)
+                        .await
+                    {
+                        Ok(values) => observed.extend(values.into_iter().map(|value| value.id)),
+                        Err(error) => {
+                            relation_complete = false;
+                            diagnostics.push(format!(
+                                "ancestorThreadId unavailable for {probe_root}: {error}"
+                            ));
+                        }
                     }
                 }
-            }
-            if observed != expected {
-                relation_complete = false;
-                diagnostics.push(format!(
-                    "ancestorThreadId result for {probe_root} does not match the complete parent closure"
-                ));
+                if observed != expected {
+                    relation_complete = false;
+                    diagnostics.push(format!(
+                        "ancestorThreadId result for {probe_root} does not match the complete parent closure"
+                    ));
+                }
             }
         }
 

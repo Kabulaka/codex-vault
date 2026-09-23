@@ -755,12 +755,12 @@ where
         tokio::select! {
             result = &mut refresh => break result.map(|trees| trees.len()),
             _ = ticker.tick() => {
-                if draw_error.is_none()
-                    && let Err(error) = terminal.draw(|frame| {
+                if draw_error.is_none() {
+                    if let Err(error) = terminal.draw(|frame| {
                         draw_scan_progress(frame, catalog, animation_frame)
-                    })
-                {
-                    draw_error = Some(error.to_string());
+                    }) {
+                        draw_error = Some(error.to_string());
+                    }
                 }
                 animation_frame = animation_frame.wrapping_add(1);
             }
@@ -818,8 +818,8 @@ where
         tokio::select! {
             result = &mut execution => break result,
             _ = ticker.tick() => {
-                if draw_error.is_none()
-                    && let Err(error) = terminal.draw(|frame| {
+                if draw_error.is_none() {
+                    if let Err(error) = terminal.draw(|frame| {
                         draw_execution(
                             frame,
                             catalog,
@@ -827,9 +827,9 @@ where
                             progress.get(),
                             animation_frame,
                         )
-                    })
-                {
-                    draw_error = Some(error.to_string());
+                    }) {
+                        draw_error = Some(error.to_string());
+                    }
                 }
                 animation_frame = animation_frame.wrapping_add(1);
             }
@@ -1301,15 +1301,13 @@ fn draw_header<G, S>(
             .add_modifier(Modifier::BOLD),
     )];
     for (index, key) in labels.iter().enumerate() {
-        let style = if index == step {
-            Style::default()
+        let style = match index.cmp(&step) {
+            std::cmp::Ordering::Equal => Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else if index < step {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+            std::cmp::Ordering::Less => Style::default().fg(Color::Green),
+            std::cmp::Ordering::Greater => Style::default().fg(Color::DarkGray),
         };
         step_line.push(Span::styled(
             format!("{} {}", index + 1, state.catalog.text(key)),
