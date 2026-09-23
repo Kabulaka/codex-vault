@@ -7,7 +7,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use codex_vault::{
-    adapters::{codex::AppServerClient, storage::StorageBackend},
+    adapters::{
+        codex::{AppServerClient, ConnectionMode},
+        storage::StorageBackend,
+    },
     application::VaultService,
     ui,
 };
@@ -21,6 +24,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 struct Options {
     codex: PathBuf,
     database: PathBuf,
+    connection: ConnectionMode,
 }
 
 impl Options {
@@ -37,12 +41,14 @@ impl Options {
         let mut args = args.into_iter().map(Into::into);
         let mut codex = PathBuf::from("codex");
         let mut database = None;
+        let mut connection = ConnectionMode::Auto;
         while let Some(argument) = args.next() {
             match argument.to_str() {
                 Some("-h" | "--help") => {
                     println!(
-                        "Codex Vault {}\n\nUsage: codex-vault [--codex PATH] [--db PATH]\n\n\
-                         A local interactive TUI. No unattended write mode is provided.",
+                        "Codex Vault {}\n\nUsage: codex-vault [--codex PATH] [--db PATH] \
+                         [--connection auto|attached|managed]\n\n\
+                         A current-host interactive TUI. No unattended write mode is provided.",
                         env!("CARGO_PKG_VERSION")
                     );
                     return Ok(None);
@@ -53,6 +59,9 @@ impl Options {
                 }
                 Some("--codex") => codex = required_path("--codex", args.next())?,
                 Some("--db") => database = Some(required_path("--db", args.next())?),
+                Some("--connection") => {
+                    connection = required_connection(args.next())?;
+                }
                 Some(value) => bail!("unknown argument: {value}"),
                 None => bail!("arguments must be valid UTF-8"),
             }
@@ -61,7 +70,21 @@ impl Options {
             Some(path) => path,
             None => default_database()?,
         };
-        Ok(Some(Self { codex, database }))
+        Ok(Some(Self {
+            codex,
+            database,
+            connection,
+        }))
+    }
+}
+
+fn required_connection(value: Option<OsString>) -> Result<ConnectionMode> {
+    match value.and_then(|value| value.into_string().ok()).as_deref() {
+        Some("auto") => Ok(ConnectionMode::Auto),
+        Some("attached") => Ok(ConnectionMode::Attached),
+        Some("managed") => Ok(ConnectionMode::Managed),
+        Some(value) => bail!("invalid --connection value: {value}"),
+        None => bail!("--connection requires auto, attached, or managed"),
     }
 }
 
@@ -127,18 +150,10 @@ async fn main() -> Result<()> {
         return Ok(());
     };
     let store = StorageBackend::open_or_read_only(&options.database);
-    let client = AppServerClient::spawn(&options.codex)
+    let client = AppServerClient::connect(&options.codex, options.connection)
         .await
-        .context("unable to start and initialize local codex app-server")?;
+        .context("unable to connect to the current host Codex app-server")?;
     let mut service = VaultService::new(client, store);
-    eprintln!("Codex Vault: scanning local session metadata through app-server...");
-    service
-        .refresh()
-        .await
-        .context("unable to discover local Codex sessions")?;
-    service
-        .recover_and_prune()
-        .context("unable to reconcile interrupted operations")?;
     let preferences = service.load_preferences().unwrap_or_default();
 
     let cleanup = TerminalCleanup::activate().context("unable to initialize terminal")?;
@@ -184,5 +199,24 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(options.database, PathBuf::from("/tmp/explicit.db"));
+        assert_eq!(options.connection, ConnectionMode::Auto);
+    }
+
+    #[test]
+    fn connection_mode_is_explicit_and_validated() {
+        let options = Options::parse_from(
+            ["--db", "/tmp/explicit.db", "--connection", "attached"],
+            || bail!("HOME unavailable"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(options.connection, ConnectionMode::Attached);
+        assert!(
+            Options::parse_from(
+                ["--db", "/tmp/explicit.db", "--connection", "invalid"],
+                || bail!("HOME unavailable"),
+            )
+            .is_err()
+        );
     }
 }

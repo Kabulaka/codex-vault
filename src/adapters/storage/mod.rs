@@ -290,10 +290,10 @@ impl OperationStore for SqliteStore {
                     let language: String = row.get(0)?;
                     let kind: String = row.get(1)?;
                     let raw: String = row.get(2)?;
-                    let cutoff = if kind == "absolute" {
-                        Cutoff::Absolute(raw.parse().unwrap_or(0))
-                    } else {
-                        Cutoff::RollingDays(raw.parse().unwrap_or(30))
+                    let cutoff = match kind.as_str() {
+                        "all" => Cutoff::All,
+                        "absolute" => Cutoff::Absolute(raw.parse().unwrap_or(0)),
+                        _ => Cutoff::RollingDays(raw.parse().unwrap_or(30)),
                     };
                     let archived = row.get::<_, Option<i64>>(4)?.map(|value| value != 0);
                     Ok(Preferences {
@@ -311,6 +311,7 @@ impl OperationStore for SqliteStore {
 
     fn save_preferences(&mut self, value: &Preferences) -> Result<(), VaultError> {
         let (kind, cutoff) = match value.cutoff {
+            Cutoff::All => ("all", String::new()),
             Cutoff::RollingDays(days) => ("rolling_days", days.to_string()),
             Cutoff::Absolute(epoch) => ("absolute", epoch.to_string()),
         };
@@ -833,5 +834,12 @@ mod tests {
         };
         store.save_preferences(&value).unwrap();
         assert_eq!(store.load_preferences().unwrap(), value);
+
+        let all = Preferences {
+            cutoff: Cutoff::All,
+            ..value
+        };
+        store.save_preferences(&all).unwrap();
+        assert_eq!(store.load_preferences().unwrap(), all);
     }
 }

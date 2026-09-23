@@ -4,8 +4,9 @@ use std::{
 };
 
 use crate::domain::{
-    Action, Filter, ItemResult, OperationPreview, OperationResult, OperationStore, PlannedTree,
-    Preferences, ScanSnapshot, SessionGateway, SessionTree, VaultError, build_trees,
+    Action, Filter, ItemResult, MaintenanceCandidate, MaintenancePlan, OperationPreview,
+    OperationResult, OperationStore, PlannedTree, Preferences, ScanSnapshot, SessionGateway,
+    SessionTree, VaultError, build_trees,
 };
 
 pub struct VaultService<G, S> {
@@ -13,6 +14,20 @@ pub struct VaultService<G, S> {
     store: S,
     snapshot: Option<ScanSnapshot>,
     trees: Vec<SessionTree>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionPhase {
+    Validating,
+    Applying,
+    Verifying,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecutionProgress {
+    pub phase: ExecutionPhase,
+    pub completed: usize,
+    pub total: usize,
 }
 
 impl<G, S> VaultService<G, S>
@@ -60,6 +75,7 @@ where
                             (Action::Archive, Some(node)) => node.archived,
                             (Action::Restore, Some(node)) => !node.archived,
                             (Action::Delete, None) => true,
+                            (Action::Cleanup, _) => false,
                             _ => false,
                         };
                     (
@@ -100,6 +116,10 @@ where
             .as_ref()
             .map(|value| value.diagnostics.as_slice())
             .unwrap_or(&[])
+    }
+
+    pub fn target_summary(&self) -> Option<&str> {
+        self.gateway.target_summary()
     }
 
     pub fn filtered(&self, filter: &Filter) -> Vec<&SessionTree> {
@@ -147,15 +167,53 @@ where
         }
     }
 
+    pub fn maintenance_candidates(&self) -> &[MaintenanceCandidate] {
+        self.gateway.maintenance_candidates()
+    }
+
+    pub fn maintenance_preview(&self, selected: &BTreeSet<String>) -> MaintenancePlan {
+        let mut candidates = self
+            .gateway
+            .maintenance_candidates()
+            .iter()
+            .filter(|candidate| selected.contains(&candidate.key))
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.key.cmp(&right.key));
+        let total_bytes = candidates.iter().map(|candidate| candidate.bytes).sum();
+        MaintenancePlan {
+            candidates,
+            total_bytes,
+        }
+    }
+
     pub async fn execute(
         &mut self,
         preview: &OperationPreview,
         delete_confirmation: Option<usize>,
     ) -> Result<OperationResult, VaultError> {
+        self.execute_with_progress(preview, delete_confirmation, |_| {})
+            .await
+    }
+
+    pub(crate) async fn execute_with_progress<F>(
+        &mut self,
+        preview: &OperationPreview,
+        delete_confirmation: Option<usize>,
+        mut on_progress: F,
+    ) -> Result<OperationResult, VaultError>
+    where
+        F: FnMut(ExecutionProgress),
+    {
         if preview.trees.is_empty() || preview.impacted_count == 0 {
             return Err(VaultError::Blocked("nothing eligible is selected".into()));
         }
 
+        on_progress(ExecutionProgress {
+            phase: ExecutionPhase::Validating,
+            completed: 0,
+            total: preview.impacted_count,
+        });
         self.refresh().await?;
         let current = self
             .trees
@@ -214,15 +272,30 @@ where
             self.store
                 .begin_batch(&plan_key, preview.action, now_epoch(), node_ids.as_slice())?;
 
+        on_progress(ExecutionProgress {
+            phase: ExecutionPhase::Applying,
+            completed: 0,
+            total: node_ids.len(),
+        });
         let mut calls = BTreeMap::new();
-        for node_id in &node_ids {
+        for (index, node_id) in node_ids.iter().enumerate() {
             let result = match self.gateway.mutate(preview.action, node_id).await {
                 Ok(_) => ItemResult::Interrupted,
                 Err(error) => ItemResult::Failed(error.to_string()),
             };
             calls.insert(node_id.clone(), result);
+            on_progress(ExecutionProgress {
+                phase: ExecutionPhase::Applying,
+                completed: index + 1,
+                total: node_ids.len(),
+            });
         }
 
+        on_progress(ExecutionProgress {
+            phase: ExecutionPhase::Verifying,
+            completed: node_ids.len(),
+            total: node_ids.len(),
+        });
         let rescan = self.gateway.scan().await;
         let mut items = BTreeMap::new();
         let mut warnings = Vec::new();
@@ -324,6 +397,139 @@ where
         })
     }
 
+    pub(crate) async fn cleanup_with_progress<F>(
+        &mut self,
+        plan: &MaintenancePlan,
+        mut on_progress: F,
+    ) -> Result<OperationResult, VaultError>
+    where
+        F: FnMut(ExecutionProgress),
+    {
+        if plan.candidates.is_empty() {
+            return Err(VaultError::Blocked(
+                "no dirty-data candidates are selected".into(),
+            ));
+        }
+        self.store.write_ready()?;
+        let total = plan.candidates.len();
+        on_progress(ExecutionProgress {
+            phase: ExecutionPhase::Validating,
+            completed: 0,
+            total,
+        });
+        self.refresh().await?;
+        let current = self
+            .gateway
+            .maintenance_candidates()
+            .iter()
+            .map(|candidate| (candidate.key.as_str(), candidate))
+            .collect::<BTreeMap<_, _>>();
+        for candidate in &plan.candidates {
+            let Some(actual) = current.get(candidate.key.as_str()) else {
+                return Err(VaultError::StalePreview);
+            };
+            if actual.fingerprint != candidate.fingerprint || actual.kind != candidate.kind {
+                return Err(VaultError::StalePreview);
+            }
+        }
+
+        let keys = plan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.key.clone())
+            .collect::<Vec<_>>();
+        let plan_key = maintenance_plan_key(&plan.candidates);
+        let batch_id =
+            self.store
+                .begin_batch(&plan_key, Action::Cleanup, now_epoch(), keys.as_slice())?;
+        let mut items = BTreeMap::new();
+        let mut backup_paths = BTreeSet::new();
+        on_progress(ExecutionProgress {
+            phase: ExecutionPhase::Applying,
+            completed: 0,
+            total,
+        });
+        for (index, candidate) in plan.candidates.iter().enumerate() {
+            let result = match self.gateway.cleanup(&batch_id, candidate).await {
+                Ok(ack) => {
+                    backup_paths.insert(ack.backup_path);
+                    ItemResult::Interrupted
+                }
+                Err(error) => ItemResult::Failed(error.to_string()),
+            };
+            items.insert(candidate.key.clone(), result);
+            on_progress(ExecutionProgress {
+                phase: ExecutionPhase::Applying,
+                completed: index + 1,
+                total,
+            });
+        }
+
+        on_progress(ExecutionProgress {
+            phase: ExecutionPhase::Verifying,
+            completed: total,
+            total,
+        });
+        let mut warnings = backup_paths
+            .into_iter()
+            .map(|path| format!("backup: {path}"))
+            .collect::<Vec<_>>();
+        match self.gateway.scan().await {
+            Ok(snapshot) => {
+                let remaining = self
+                    .gateway
+                    .maintenance_candidates()
+                    .iter()
+                    .map(|candidate| candidate.key.as_str())
+                    .collect::<BTreeSet<_>>();
+                for candidate in &plan.candidates {
+                    let value = items
+                        .get_mut(&candidate.key)
+                        .expect("planned maintenance item is recorded");
+                    if matches!(value, ItemResult::Interrupted) {
+                        *value = if remaining.contains(candidate.key.as_str()) {
+                            ItemResult::Failed("final state still contains the candidate".into())
+                        } else {
+                            ItemResult::Success
+                        };
+                    }
+                }
+                self.trees = build_trees(&snapshot);
+                self.snapshot = Some(snapshot);
+            }
+            Err(error) => {
+                warnings.push(format!("final maintenance rescan failed: {error}"));
+            }
+        }
+        let status = if items.values().all(|value| *value == ItemResult::Success) {
+            "completed"
+        } else if items
+            .values()
+            .any(|value| matches!(value, ItemResult::Interrupted))
+        {
+            "needs_verification"
+        } else {
+            "partial"
+        };
+        if let Err(error) = self
+            .store
+            .complete_batch(&batch_id, &items, status, now_epoch())
+        {
+            warnings.push(format!(
+                "maintenance result could not be recorded transactionally: {error}"
+            ));
+            for value in items.values_mut() {
+                *value = ItemResult::Interrupted;
+            }
+        }
+        Ok(OperationResult {
+            batch_id,
+            action: Action::Cleanup,
+            items,
+            warnings,
+        })
+    }
+
     pub fn history(&self, limit: usize) -> Result<Vec<crate::domain::HistoryEntry>, VaultError> {
         self.store.history(limit)
     }
@@ -336,6 +542,15 @@ pub fn now_epoch() -> i64 {
         .as_secs()
         .try_into()
         .unwrap_or(i64::MAX)
+}
+
+fn maintenance_plan_key(candidates: &[MaintenanceCandidate]) -> String {
+    let mut values = candidates
+        .iter()
+        .map(|candidate| format!("{}:{}", candidate.key, candidate.fingerprint))
+        .collect::<Vec<_>>();
+    values.sort();
+    format!("cleanup|{}", values.join(";"))
 }
 
 fn plan_signature(tree: &SessionTree, action: Action) -> String {
@@ -478,7 +693,10 @@ mod tests {
                     id: "root".into(),
                     title: "root".into(),
                     project: None,
+                    provider: None,
+                    model: None,
                     cwd: "/tmp".into(),
+                    rollout_bytes: None,
                     last_activity: Some(1),
                     archived,
                     pinned: Some(false),
@@ -490,7 +708,10 @@ mod tests {
                     id: "child".into(),
                     title: "child".into(),
                     project: None,
+                    provider: None,
+                    model: None,
                     cwd: "/tmp".into(),
+                    rollout_bytes: None,
                     last_activity: Some(1),
                     archived,
                     pinned: Some(false),
@@ -520,10 +741,44 @@ mod tests {
         service.refresh().await.unwrap();
         let selected = BTreeSet::from(["root".to_owned()]);
         let preview = service.preview(&selected, Action::Archive);
-        let result = service.execute(&preview, None).await.unwrap();
+        let mut progress = Vec::new();
+        let result = service
+            .execute_with_progress(&preview, None, |value| progress.push(value))
+            .await
+            .unwrap();
         assert!(result.is_complete_success());
         assert_eq!(*calls.lock().unwrap(), vec!["child", "root"]);
         assert!(service.store.began);
+        assert_eq!(
+            progress,
+            vec![
+                ExecutionProgress {
+                    phase: ExecutionPhase::Validating,
+                    completed: 0,
+                    total: 2,
+                },
+                ExecutionProgress {
+                    phase: ExecutionPhase::Applying,
+                    completed: 0,
+                    total: 2,
+                },
+                ExecutionProgress {
+                    phase: ExecutionPhase::Applying,
+                    completed: 1,
+                    total: 2,
+                },
+                ExecutionProgress {
+                    phase: ExecutionPhase::Applying,
+                    completed: 2,
+                    total: 2,
+                },
+                ExecutionProgress {
+                    phase: ExecutionPhase::Verifying,
+                    completed: 2,
+                    total: 2,
+                },
+            ]
+        );
     }
 
     #[tokio::test]

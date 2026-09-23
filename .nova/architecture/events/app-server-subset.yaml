@@ -1,15 +1,26 @@
 asyncapi: 3.0.0
 info:
   title: Codex Vault app-server protocol subset
-  version: 1.1.0
+  version: 1.5.0
   description: >-
-    Capability-driven JSONL subset used by Codex Vault over a locally owned
-    codex app-server stdio process. Unknown fields are accepted; missing
-    required capabilities disable all write operations. Thread pin state is
-    preferred from explicit reliable response fields; when the current server
-    omits them or demonstrably ignores isPinned filters, Codex Vault may only
-    supplement scanned thread IDs from a read-only Codex state-store query of
-    threads(id, is_pinned). Incomplete observations remain unknown.
+    Capability-driven JSON-RPC subset used by Codex Vault. Managed mode uses
+    JSONL over app-server stdio. Attached mode performs the app-server
+    WebSocket handshake and exchanges text frames through the official
+    app-server proxy connected to the current-host Unix control socket. Auto
+    mode attaches when that socket exists and otherwise starts a Vault-managed
+    app-server stdio process. An existing but unusable control socket fails
+    closed instead of creating a second app-server. The current-host Codex
+    SQLite catalog is the discovery and relationship authority; app-server
+    list/read only enrich catalogued IDs with runtime metadata and may not
+    narrow historical coverage. This protocol subset is read-only; archive,
+    unarchive, and delete are delegated to the current-host official Codex CLI.
+    Unknown fields are accepted; missing required runtime capabilities or CLI
+    commands protect the affected scope. A catalogued ID omitted by thread/list
+    is read with includeTurns=false; unavailable runtime metadata remains
+    protected rather than disappearing. Relationship or source failures with a
+    proven tree scope protect that tree; ambiguity that may affect any
+    interactive tree disables all writes. Incomplete observations remain
+    unknown.
 defaultContentType: application/json
 channels:
   clientToServer:
@@ -23,8 +34,6 @@ channels:
         $ref: '#/components/messages/ThreadListRequest'
       threadReadRequest:
         $ref: '#/components/messages/ThreadReadRequest'
-      threadActionRequest:
-        $ref: '#/components/messages/ThreadActionRequest'
   serverToClient:
     address: stdout
     messages:
@@ -42,7 +51,6 @@ operations:
       - $ref: '#/channels/clientToServer/messages/initializedNotification'
       - $ref: '#/channels/clientToServer/messages/threadListRequest'
       - $ref: '#/channels/clientToServer/messages/threadReadRequest'
-      - $ref: '#/channels/clientToServer/messages/threadActionRequest'
   receiveResponses:
     action: receive
     channel:
@@ -64,9 +72,6 @@ components:
     ThreadReadRequest:
       payload:
         $ref: '#/components/schemas/ThreadReadRequest'
-    ThreadActionRequest:
-      payload:
-        $ref: '#/components/schemas/ThreadActionRequest'
     Response:
       payload:
         $ref: '#/components/schemas/Response'
@@ -169,6 +174,10 @@ components:
               const: thread/read
             params:
               type: object
+              description: >-
+                Reads metadata only. Codex Vault uses this request to hydrate
+                runtime metadata for catalogued IDs omitted by thread/list and
+                never requests turns for compatibility discovery.
               required: [threadId, includeTurns]
               properties:
                 threadId:
@@ -176,21 +185,6 @@ components:
                   minLength: 1
                 includeTurns:
                   const: false
-              additionalProperties: true
-    ThreadActionRequest:
-      allOf:
-        - $ref: '#/components/schemas/RequestEnvelope'
-        - type: object
-          properties:
-            method:
-              enum: [thread/archive, thread/unarchive, thread/delete]
-            params:
-              type: object
-              required: [threadId]
-              properties:
-                threadId:
-                  type: string
-                  minLength: 1
               additionalProperties: true
     Response:
       type: object
@@ -223,6 +217,48 @@ components:
           items:
             type: string
       additionalProperties: true
+    SubAgentSource:
+      oneOf:
+        - enum: [review, compact, memory_consolidation]
+        - type: object
+          required: [thread_spawn]
+          properties:
+            thread_spawn:
+              type: object
+              required: [parent_thread_id, depth]
+              properties:
+                parent_thread_id:
+                  type: string
+                  minLength: 1
+                depth:
+                  type: integer
+              additionalProperties: true
+          additionalProperties: false
+        - type: object
+          required: [other]
+          properties:
+            other:
+              type: string
+          additionalProperties: false
+    ThreadSource:
+      oneOf:
+        - enum:
+            - cli
+            - vscode
+            - exec
+            - appServer
+            - subAgent
+            - subAgentReview
+            - subAgentCompact
+            - subAgentThreadSpawn
+            - subAgentOther
+            - unknown
+        - type: object
+          required: [subAgent]
+          properties:
+            subAgent:
+              $ref: '#/components/schemas/SubAgentSource'
+          additionalProperties: true
     ThreadSummary:
       type: object
       required: [id, status]
@@ -250,6 +286,12 @@ components:
             callers must not default it to false.
         parentThreadId:
           type: [string, 'null']
+          description: >-
+            thread/list may omit this field for a sub-agent. A metadata-only
+            thread/read is authoritative for hydration; disagreement remains
+            ambiguous and must not be guessed.
+        source:
+          $ref: '#/components/schemas/ThreadSource'
         status:
           $ref: '#/components/schemas/RuntimeStatus'
       additionalProperties: true

@@ -11,6 +11,7 @@ pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, VaultError>> 
 pub enum VaultError {
     Unavailable(String),
     Protocol(String),
+    Command(String),
     Storage(String),
     Blocked(String),
     StalePreview,
@@ -22,6 +23,7 @@ impl fmt::Display for VaultError {
         match self {
             Self::Unavailable(message) => write!(f, "app-server unavailable: {message}"),
             Self::Protocol(message) => write!(f, "app-server protocol error: {message}"),
+            Self::Command(message) => write!(f, "Codex CLI command failed: {message}"),
             Self::Storage(message) => {
                 write!(f, "local operation record unavailable: {message}")
             }
@@ -61,6 +63,7 @@ impl Language {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cutoff {
+    All,
     RollingDays(u32),
     Absolute(i64),
 }
@@ -74,6 +77,7 @@ impl Default for Cutoff {
 impl Cutoff {
     pub fn epoch_seconds(&self, now: i64) -> i64 {
         match self {
+            Self::All => i64::MAX,
             Self::RollingDays(days) => now.saturating_sub(i64::from(*days) * 86_400),
             Self::Absolute(value) => *value,
         }
@@ -164,6 +168,7 @@ pub enum ProtectionReason {
     WaitingApproval,
     WaitingInput,
     UnsafeStatus(String),
+    UnverifiableSource,
     MissingTimestamp,
     IncompleteRelations,
     WriteCapabilityMissing,
@@ -179,6 +184,7 @@ impl fmt::Display for ProtectionReason {
             Self::WaitingApproval => write!(f, "waiting for approval"),
             Self::WaitingInput => write!(f, "waiting for user input"),
             Self::UnsafeStatus(value) => write!(f, "unsafe status: {value}"),
+            Self::UnverifiableSource => write!(f, "thread source is unverifiable"),
             Self::MissingTimestamp => write!(f, "last activity is unavailable"),
             Self::IncompleteRelations => write!(f, "thread relationship is incomplete"),
             Self::WriteCapabilityMissing => write!(f, "required app-server capability is missing"),
@@ -192,7 +198,11 @@ pub struct SessionNode {
     pub id: String,
     pub title: String,
     pub project: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub cwd: String,
+    /// Size of the validated rollout file at scan time; absent when unavailable.
+    pub rollout_bytes: Option<u64>,
     pub last_activity: Option<i64>,
     pub archived: bool,
     pub pinned: Option<bool>,
@@ -207,6 +217,9 @@ impl SessionNode {
             Some(true) => return Some(ProtectionReason::Pinned),
             None => return Some(ProtectionReason::PinnedUnknown),
             Some(false) => {}
+        }
+        if !self.source.is_known() {
+            return Some(ProtectionReason::UnverifiableSource);
         }
         if self.last_activity.is_none() {
             return Some(ProtectionReason::MissingTimestamp);
@@ -232,6 +245,12 @@ pub struct SessionTree {
 }
 
 impl SessionTree {
+    pub fn storage_bytes(&self) -> Option<u64> {
+        self.nodes
+            .iter()
+            .try_fold(0u64, |total, node| total.checked_add(node.rollout_bytes?))
+    }
+
     pub fn is_fully_archived(&self) -> bool {
         self.nodes.iter().all(|node| node.archived)
     }
@@ -279,6 +298,7 @@ impl SessionTree {
                 Action::Archive => !node.archived,
                 Action::Restore => node.archived,
                 Action::Delete => node.archived,
+                Action::Cleanup => false,
             })
             .map(|node| node.id.clone())
             .collect()
@@ -290,10 +310,12 @@ impl SessionTree {
             .iter()
             .map(|node| {
                 format!(
-                    "{}|{}|{}|{}|{}|{}",
+                    "{}|{}|{}|{}|{}|{}|{}|{}",
                     node.id,
                     node.parent_id.as_deref().unwrap_or(""),
                     node.archived,
+                    node.provider.as_deref().unwrap_or(""),
+                    node.model.as_deref().unwrap_or(""),
                     node.pinned
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "unknown".into()),
@@ -414,7 +436,9 @@ fn node_matches_token(node: &SessionNode, token: &str) -> bool {
     match field {
         Some("id") => contains(&node.id),
         Some("title") => contains(&node.title),
-        Some("project") => contains(node.project.as_deref().unwrap_or("")),
+        Some("project") => contains(node.project.as_deref().unwrap_or("")) || contains(&node.cwd),
+        Some("provider") => contains(node.provider.as_deref().unwrap_or("")),
+        Some("model") => contains(node.model.as_deref().unwrap_or("")),
         Some("cwd") => contains(&node.cwd),
         Some(_) => false,
         None => [
@@ -422,6 +446,8 @@ fn node_matches_token(node: &SessionNode, token: &str) -> bool {
             node.title.as_str(),
             node.cwd.as_str(),
             node.project.as_deref().unwrap_or(""),
+            node.provider.as_deref().unwrap_or(""),
+            node.model.as_deref().unwrap_or(""),
         ]
         .iter()
         .any(|candidate| contains(candidate)),
@@ -433,6 +459,7 @@ pub enum Action {
     Archive,
     Restore,
     Delete,
+    Cleanup,
 }
 
 impl Action {
@@ -441,6 +468,7 @@ impl Action {
             Self::Archive => "archive",
             Self::Restore => "restore",
             Self::Delete => "delete",
+            Self::Cleanup => "cleanup",
         }
     }
 
@@ -449,9 +477,49 @@ impl Action {
             "archive" => Some(Self::Archive),
             "restore" => Some(Self::Restore),
             "delete" => Some(Self::Delete),
+            "cleanup" => Some(Self::Cleanup),
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MaintenanceKind {
+    UnreferencedRollout,
+    StaleSpawnEdge,
+    MissingRolloutThread,
+}
+
+impl MaintenanceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnreferencedRollout => "unreferenced_rollout",
+            Self::StaleSpawnEdge => "stale_spawn_edge",
+            Self::MissingRolloutThread => "missing_rollout_thread",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceCandidate {
+    pub key: String,
+    pub kind: MaintenanceKind,
+    pub label: String,
+    pub detail: String,
+    pub project: Option<String>,
+    pub bytes: u64,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenancePlan {
+    pub candidates: Vec<MaintenanceCandidate>,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceAck {
+    pub backup_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,8 +595,28 @@ pub struct PendingBatch {
 }
 
 pub trait SessionGateway {
+    fn target_summary(&self) -> Option<&str> {
+        None
+    }
+
     fn scan(&mut self) -> PortFuture<'_, ScanSnapshot>;
     fn mutate<'a>(&'a mut self, action: Action, thread_id: &'a str) -> PortFuture<'a, MutationAck>;
+
+    fn maintenance_candidates(&self) -> &[MaintenanceCandidate] {
+        &[]
+    }
+
+    fn cleanup<'a>(
+        &'a mut self,
+        _batch_id: &'a str,
+        _candidate: &'a MaintenanceCandidate,
+    ) -> PortFuture<'a, MaintenanceAck> {
+        Box::pin(async {
+            Err(VaultError::Blocked(
+                "dirty-data maintenance is unavailable".into(),
+            ))
+        })
+    }
 }
 
 pub trait OperationStore {
@@ -563,7 +651,10 @@ mod tests {
             id: id.into(),
             title: id.into(),
             project: Some("p".into()),
+            provider: Some("free".into()),
+            model: Some("gpt-test".into()),
             cwd: "/p".into(),
+            rollout_bytes: Some(512),
             last_activity: Some(100),
             archived,
             pinned: Some(false),
@@ -592,6 +683,24 @@ mod tests {
     }
 
     #[test]
+    fn tree_storage_sums_descendants_without_claiming_incomplete_sizes() {
+        let mut tree = SessionTree {
+            root_id: "root".into(),
+            nodes: vec![
+                node("root", None, SessionSource::Cli, false),
+                node("child", Some("root"), SessionSource::Descendant, false),
+            ],
+            last_activity: Some(100),
+            protection: vec![],
+        };
+        assert_eq!(tree.storage_bytes(), Some(1024));
+        tree.nodes[1].rollout_bytes = None;
+        assert_eq!(tree.storage_bytes(), None);
+        tree.nodes[1].rollout_bytes = Some(u64::MAX);
+        assert_eq!(tree.storage_bytes(), None);
+    }
+
+    #[test]
     fn one_day_is_a_rolling_twenty_four_hours() {
         let tree = SessionTree {
             root_id: "root".into(),
@@ -607,6 +716,23 @@ mod tests {
         };
         assert!(filter.matches(&tree, 172_800));
         assert!(!filter.matches(&tree, 172_799));
+    }
+
+    #[test]
+    fn all_cutoff_includes_recent_activity() {
+        let tree = SessionTree {
+            root_id: "root".into(),
+            nodes: vec![node("root", None, SessionSource::Cli, false)],
+            last_activity: Some(9_999),
+            protection: vec![],
+        };
+        let filter = Filter {
+            cutoff: Cutoff::All,
+            project: None,
+            query: None,
+            archived: None,
+        };
+        assert!(filter.matches(&tree, 100));
     }
 
     #[test]
@@ -649,6 +775,32 @@ mod tests {
             diagnostics: vec![],
         });
         assert_eq!(trees[0].protection, vec![ProtectionReason::WaitingApproval]);
+    }
+
+    #[test]
+    fn unverifiable_source_blocks_only_its_known_tree() {
+        let trees = build_trees(&ScanSnapshot {
+            nodes: vec![
+                node("root-a", None, SessionSource::Cli, false),
+                node(
+                    "future-child",
+                    Some("root-a"),
+                    SessionSource::Other("futureSource".into()),
+                    false,
+                ),
+                node("root-b", None, SessionSource::Vscode, false),
+            ],
+            write_capable: true,
+            relation_complete: true,
+            diagnostics: vec![],
+        });
+        let protected = trees.iter().find(|tree| tree.root_id == "root-a").unwrap();
+        let eligible = trees.iter().find(|tree| tree.root_id == "root-b").unwrap();
+        assert_eq!(
+            protected.protection,
+            vec![ProtectionReason::UnverifiableSource]
+        );
+        assert!(eligible.protection.is_empty());
     }
 
     #[test]
@@ -710,7 +862,10 @@ mod tests {
                 id: "root".into(),
                 title: "Release cleanup".into(),
                 project: Some("vault".into()),
+                provider: Some("custom".into()),
+                model: Some("gpt-5.5".into()),
                 cwd: "/work/vault".into(),
+                rollout_bytes: Some(512),
                 last_activity: Some(1),
                 archived: false,
                 pinned: Some(false),
@@ -724,7 +879,9 @@ mod tests {
         let filter = Filter {
             cutoff: Cutoff::RollingDays(1),
             project: None,
-            query: Some("project:vault title:cleanup cwd:/work".into()),
+            query: Some(
+                "project:/work title:cleanup cwd:/work provider:custom model:gpt-5.5".into(),
+            ),
             archived: None,
         };
         assert!(filter.matches(&tree, 200_000));
