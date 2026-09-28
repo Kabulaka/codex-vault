@@ -1,10 +1,12 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    env, fs, io,
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
+    env, fs,
+    hash::{Hash as _, Hasher as _},
+    io,
     io::{BufRead as _, Write as _},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     pin::Pin,
-    process::Stdio,
+    process::{Command as StdCommand, Stdio},
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
 };
@@ -108,6 +110,23 @@ struct MaintenanceDiscovery {
     active_rollouts: usize,
     archived_rollouts: usize,
     candidates: Vec<MaintenanceCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectorySnapshot {
+    bytes: u64,
+    entries: usize,
+    fingerprint: String,
+    shape: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitWorktreeState {
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    head: String,
+    branch: Option<String>,
+    admin_fingerprint: String,
 }
 
 impl CatalogThread {
@@ -969,7 +988,7 @@ impl AppServerClient {
         let root_ids = raw
             .values()
             .filter(|(dto, _)| {
-                dto.parent_thread_id().is_none() && parse_source(&dto.source).is_interactive_root()
+                dto.parent_thread_id().is_none() && parse_source(&dto.source).is_manageable_root()
             })
             .map(|(dto, _)| dto.id.clone())
             .collect::<BTreeSet<_>>();
@@ -1006,7 +1025,7 @@ impl AppServerClient {
             };
             if !parse_source(&dto.source).is_known() {
                 diagnostics.push(format!(
-                    "thread {id} has an unknown source; only its interactive tree is protected: {}",
+                    "thread {id} has an unknown source; only its managed tree is protected: {}",
                     dto.source
                 ));
             }
@@ -1718,6 +1737,227 @@ fn audit_rollout_roots(
     Ok((sessions.len(), archived.len(), orphaned))
 }
 
+fn metadata_modified_nanos(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos())
+        .unwrap_or_default()
+}
+
+fn directory_snapshot(root: &Path) -> Result<DirectorySnapshot, String> {
+    let root_metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("cannot inspect {}: {error}", root.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(format!(
+            "worktree container is not a regular directory: {}",
+            root.display()
+        ));
+    }
+
+    let mut records = vec![(
+        PathBuf::new(),
+        0u8,
+        0u64,
+        metadata_modified_nanos(&root_metadata),
+        None,
+    )];
+    let mut pending = vec![root.to_owned()];
+    let mut bytes = 0u64;
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .map_err(|error| format!("cannot scan {}: {error}", directory.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot inspect {}: {error}", directory.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| format!("worktree path escaped {}", root.display()))?
+                .to_owned();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            let modified = metadata_modified_nanos(&metadata);
+            if metadata.file_type().is_symlink() {
+                let target = fs::read_link(&path)
+                    .map_err(|error| format!("cannot read link {}: {error}", path.display()))?;
+                records.push((relative, 2, 0, modified, Some(target)));
+            } else if metadata.is_dir() {
+                records.push((relative, 0, 0, modified, None));
+                pending.push(path);
+            } else if metadata.is_file() {
+                bytes = bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| format!("worktree size overflow under {}", root.display()))?;
+                records.push((relative, 1, metadata.len(), modified, None));
+            } else {
+                return Err(format!(
+                    "worktree contains an unsupported filesystem entry: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut fingerprint = DefaultHasher::new();
+    let mut shape = DefaultHasher::new();
+    for (relative, kind, len, modified, target) in &records {
+        relative.hash(&mut fingerprint);
+        kind.hash(&mut fingerprint);
+        len.hash(&mut fingerprint);
+        modified.hash(&mut fingerprint);
+        target.hash(&mut fingerprint);
+
+        relative.hash(&mut shape);
+        kind.hash(&mut shape);
+        len.hash(&mut shape);
+        target.hash(&mut shape);
+    }
+    Ok(DirectorySnapshot {
+        bytes,
+        entries: records.len(),
+        fingerprint: format!("{}:{bytes}:{}", records.len(), fingerprint.finish()),
+        shape: format!("{}:{bytes}:{}", records.len(), shape.finish()),
+    })
+}
+
+fn physical_path_allow_missing(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("path is not absolute: {}", path.display()));
+    }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(format!(
+            "path contains an unsafe parent component: {}",
+            path.display()
+        ));
+    }
+
+    let mut current = path.to_owned();
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(&current) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = current
+                    .file_name()
+                    .ok_or_else(|| format!("cannot resolve missing path {}", path.display()))?;
+                missing.push(name.to_owned());
+                current = current
+                    .parent()
+                    .ok_or_else(|| format!("cannot resolve path {}", path.display()))?
+                    .to_owned();
+            }
+            Err(error) => {
+                return Err(format!("cannot resolve {}: {error}", current.display()));
+            }
+        }
+    }
+}
+
+fn catalog_owns_worktree(
+    worktrees_root: &Path,
+    container: &Path,
+    catalog: &CatalogSnapshot,
+) -> Result<bool, String> {
+    let canonical_root = fs::canonicalize(worktrees_root).map_err(|error| {
+        format!(
+            "cannot resolve worktree root {}: {error}",
+            worktrees_root.display()
+        )
+    })?;
+    let canonical_container = fs::canonicalize(container).map_err(|error| {
+        format!(
+            "cannot resolve worktree container {}: {error}",
+            container.display()
+        )
+    })?;
+    if canonical_container.parent() != Some(canonical_root.as_path()) {
+        return Err(format!(
+            "worktree container escaped its physical root: {}",
+            container.display()
+        ));
+    }
+    for thread in catalog.threads.values() {
+        let cwd = Path::new(&thread.cwd);
+        let canonical_cwd = physical_path_allow_missing(cwd)
+            .map_err(|error| format!("cannot resolve cwd for thread {}: {error}", thread.id))?;
+        if canonical_cwd == canonical_root
+            || canonical_cwd == canonical_container
+            || canonical_cwd.starts_with(&canonical_container)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn discover_unreferenced_worktrees(
+    codex_home: &Path,
+    catalog: &CatalogSnapshot,
+) -> Result<Vec<MaintenanceCandidate>, String> {
+    let root = codex_home.join("worktrees");
+    let root_metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", root.display())),
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(format!(
+            "worktree root is not a regular directory: {}",
+            root.display()
+        ));
+    }
+
+    let mut entries = fs::read_dir(&root)
+        .map_err(|error| format!("cannot scan {}: {error}", root.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot inspect {}: {error}", root.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Err(format!(
+                "worktree root contains an unsupported entry: {}",
+                path.display()
+            ));
+        }
+        if catalog_owns_worktree(&root, &path, catalog)? {
+            continue;
+        }
+        let snapshot = directory_snapshot(&path)?;
+        let label = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("worktree")
+            .to_owned();
+        candidates.push(MaintenanceCandidate {
+            key: format!("worktree:{}", path.display()),
+            kind: MaintenanceKind::UnreferencedWorktree,
+            label,
+            detail: path.display().to_string(),
+            project: None,
+            bytes: snapshot.bytes,
+            fingerprint: snapshot.fingerprint,
+        });
+    }
+    Ok(candidates)
+}
+
 fn discover_maintenance(
     codex_home: &Path,
     _database: &Path,
@@ -1757,6 +1997,7 @@ fn discover_maintenance(
             fingerprint: format!("{}:{modified}", metadata.len()),
         });
     }
+    candidates.extend(discover_unreferenced_worktrees(codex_home, catalog)?);
     for edge in &catalog.stale_edges {
         candidates.push(MaintenanceCandidate {
             key: format!("edge:{}:{}", edge.parent, edge.child),
@@ -2067,6 +2308,9 @@ impl AppServerClient {
             MaintenanceKind::UnreferencedRollout => {
                 cleanup_unreferenced_rollout(&codex_home, &backup_root, &actual)?;
             }
+            MaintenanceKind::UnreferencedWorktree => {
+                cleanup_unreferenced_worktree(&codex_home, &backup_root, &actual)?;
+            }
             MaintenanceKind::StaleSpawnEdge => {
                 backup_sqlite_database(&database, &backup_root)?;
                 cleanup_stale_spawn_edge(&database, &actual)?;
@@ -2119,20 +2363,28 @@ fn backup_sqlite_database(database: &Path, backup_root: &Path) -> Result<PathBuf
 }
 
 fn backup_regular_file(source: &Path, target: &Path) -> Result<(), VaultError> {
-    if target.exists() {
-        let source_len = fs::metadata(source)
-            .map_err(|error| VaultError::Storage(error.to_string()))?
-            .len();
-        let target_len = fs::metadata(target)
-            .map_err(|error| VaultError::Storage(error.to_string()))?
-            .len();
-        if source_len == target_len {
-            return Ok(());
+    match fs::symlink_metadata(target) {
+        Ok(target_metadata)
+            if target_metadata.file_type().is_symlink() || !target_metadata.is_file() =>
+        {
+            return Err(VaultError::Storage(format!(
+                "backup target is not a regular file: {}",
+                target.display()
+            )));
         }
-        return Err(VaultError::Storage(format!(
-            "backup target already exists with a different size: {}",
-            target.display()
-        )));
+        Ok(target_metadata) => {
+            let source_len = fs::metadata(source)
+                .map_err(|error| VaultError::Storage(error.to_string()))?
+                .len();
+            if source_len != target_metadata.len() {
+                return Err(VaultError::Storage(format!(
+                    "backup target already exists with a different size: {}",
+                    target.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(VaultError::Storage(error.to_string())),
     }
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|error| {
@@ -2158,6 +2410,557 @@ fn backup_regular_file(source: &Path, target: &Path) -> Result<(), VaultError> {
     fs::File::open(target)
         .and_then(|file| file.sync_all())
         .map_err(|error| VaultError::Storage(format!("cannot sync backup: {error}")))?;
+    Ok(())
+}
+
+fn copy_directory_for_backup(source: &Path, target: &Path) -> Result<(), VaultError> {
+    let source_metadata = fs::symlink_metadata(source).map_err(|error| {
+        VaultError::Storage(format!("cannot inspect {}: {error}", source.display()))
+    })?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Err(VaultError::Blocked(format!(
+            "worktree backup source is not a regular directory: {}",
+            source.display()
+        )));
+    }
+    match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(VaultError::Storage(format!(
+                "worktree backup target is not a regular directory: {}",
+                target.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(target).map_err(|error| {
+                VaultError::Storage(format!("cannot create {}: {error}", target.display()))
+            })?;
+        }
+        Err(error) => {
+            return Err(VaultError::Storage(format!(
+                "cannot inspect {}: {error}",
+                target.display()
+            )));
+        }
+    }
+
+    let mut entries = fs::read_dir(source)
+        .map_err(|error| VaultError::Storage(format!("cannot scan {}: {error}", source.display())))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| VaultError::Storage(error.to_string()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path).map_err(|error| {
+            VaultError::Storage(format!("cannot inspect {}: {error}", source_path.display()))
+        })?;
+        if metadata.file_type().is_symlink() {
+            let link_target = fs::read_link(&source_path).map_err(|error| {
+                VaultError::Storage(format!(
+                    "cannot read link {}: {error}",
+                    source_path.display()
+                ))
+            })?;
+            match fs::symlink_metadata(&target_path) {
+                Ok(existing) if existing.file_type().is_symlink() => {
+                    let existing_target = fs::read_link(&target_path)
+                        .map_err(|error| VaultError::Storage(error.to_string()))?;
+                    if existing_target != link_target {
+                        return Err(VaultError::Storage(format!(
+                            "backup link target differs: {}",
+                            target_path.display()
+                        )));
+                    }
+                }
+                Ok(_) => {
+                    return Err(VaultError::Storage(format!(
+                        "backup target type differs: {}",
+                        target_path.display()
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&link_target, &target_path).map_err(|error| {
+                        VaultError::Storage(format!(
+                            "cannot back up link {}: {error}",
+                            source_path.display()
+                        ))
+                    })?;
+                    #[cfg(not(unix))]
+                    return Err(VaultError::Blocked(
+                        "worktree symlink backup is unsupported on this platform".into(),
+                    ));
+                }
+                Err(error) => return Err(VaultError::Storage(error.to_string())),
+            }
+        } else if metadata.is_dir() {
+            copy_directory_for_backup(&source_path, &target_path)?;
+        } else if metadata.is_file() {
+            backup_regular_file(&source_path, &target_path)?;
+        } else {
+            return Err(VaultError::Blocked(format!(
+                "worktree contains an unsupported filesystem entry: {}",
+                source_path.display()
+            )));
+        }
+    }
+    fs::set_permissions(target, source_metadata.permissions())
+        .map_err(|error| VaultError::Storage(error.to_string()))?;
+    Ok(())
+}
+
+fn backup_worktree_directory(source: &Path, target: &Path) -> Result<(), VaultError> {
+    let source_snapshot = directory_snapshot(source).map_err(VaultError::Blocked)?;
+    copy_directory_for_backup(source, target)?;
+    let target_snapshot = directory_snapshot(target).map_err(VaultError::Storage)?;
+    if source_snapshot.entries != target_snapshot.entries
+        || source_snapshot.bytes != target_snapshot.bytes
+        || source_snapshot.shape != target_snapshot.shape
+    {
+        return Err(VaultError::Storage(format!(
+            "worktree backup verification failed for {}",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+fn linked_worktree_roots(container: &Path) -> Result<Vec<PathBuf>, VaultError> {
+    fn is_linked_git_file(path: &Path) -> Result<bool, VaultError> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(VaultError::Blocked(format!(
+                "Git worktree marker is a symbolic link: {}",
+                path.display()
+            ))),
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(VaultError::Blocked(format!(
+                "Git worktree marker has an unsupported type: {}",
+                path.display()
+            ))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(VaultError::Storage(format!(
+                "cannot inspect Git worktree marker {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    let mut roots = Vec::new();
+    let direct_git = container.join(".git");
+    if is_linked_git_file(&direct_git)? {
+        roots.push(container.to_owned());
+    }
+    let entries = fs::read_dir(container).map_err(|error| {
+        VaultError::Storage(format!("cannot scan {}: {error}", container.display()))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| VaultError::Storage(error.to_string()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| VaultError::Storage(error.to_string()))?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let git_file = entry.path().join(".git");
+        if is_linked_git_file(&git_file)? {
+            roots.push(entry.path());
+        }
+    }
+    roots.sort();
+    Ok(roots)
+}
+
+fn git_command_error(action: &str, output: &std::process::Output) -> VaultError {
+    let detail = cli_error_detail(&output.stderr, &output.stdout);
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    };
+    VaultError::Storage(format!("{action} failed with {}{suffix}", output.status))
+}
+
+fn git_stdout_path(output: &[u8]) -> PathBuf {
+    let value = output
+        .strip_suffix(b"\n")
+        .and_then(|value| value.strip_suffix(b"\r").or(Some(value)))
+        .unwrap_or(output);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        PathBuf::from(std::ffi::OsString::from_vec(value.to_vec()))
+    }
+    #[cfg(not(unix))]
+    PathBuf::from(String::from_utf8_lossy(value).into_owned())
+}
+
+fn inspect_linked_git_worktree(worktree: &Path) -> Result<GitWorktreeState, VaultError> {
+    let canonical_worktree = fs::canonicalize(worktree).map_err(|error| {
+        VaultError::Blocked(format!(
+            "cannot resolve Git worktree {}: {error}",
+            worktree.display()
+        ))
+    })?;
+    let common = StdCommand::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .map_err(|error| {
+            VaultError::Storage(format!(
+                "cannot inspect Git worktree {}: {error}",
+                worktree.display()
+            ))
+        })?;
+    if !common.status.success() {
+        return Err(git_command_error("Git worktree inspection", &common));
+    }
+    let common_dir = git_stdout_path(&common.stdout);
+    let canonical_common = fs::canonicalize(&common_dir).map_err(|error| {
+        VaultError::Blocked(format!(
+            "cannot resolve Git common directory {}: {error}",
+            common_dir.display()
+        ))
+    })?;
+    if !common_dir.is_absolute() || !canonical_common.is_dir() {
+        return Err(VaultError::Blocked(format!(
+            "Git common directory is invalid for {}",
+            worktree.display()
+        )));
+    }
+
+    let listing = StdCommand::new("git")
+        .arg("--git-dir")
+        .arg(&canonical_common)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .map_err(|error| VaultError::Storage(format!("cannot list Git worktrees: {error}")))?;
+    if !listing.status.success() {
+        return Err(git_command_error(
+            "Git worktree registration check",
+            &listing,
+        ));
+    }
+    let registered = listing.stdout.split(|byte| *byte == 0).any(|field| {
+        let Some(path) = field.strip_prefix(b"worktree ") else {
+            return false;
+        };
+        let registered_path = git_stdout_path(path);
+        fs::canonicalize(registered_path).is_ok_and(|value| value == canonical_worktree)
+    });
+    if !registered {
+        return Err(VaultError::Blocked(format!(
+            "Git worktree registration does not match {}",
+            worktree.display()
+        )));
+    }
+
+    let git_dir = StdCommand::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--path-format=absolute", "--absolute-git-dir"])
+        .output()
+        .map_err(|error| {
+            VaultError::Storage(format!("cannot inspect Git admin directory: {error}"))
+        })?;
+    if !git_dir.status.success() {
+        return Err(git_command_error(
+            "Git admin directory inspection",
+            &git_dir,
+        ));
+    }
+    let git_dir = fs::canonicalize(git_stdout_path(&git_dir.stdout)).map_err(|error| {
+        VaultError::Blocked(format!("cannot resolve Git admin directory: {error}"))
+    })?;
+    let admin_fingerprint = directory_snapshot(&git_dir)
+        .map_err(|error| VaultError::Blocked(format!("cannot inspect Git admin state: {error}")))?
+        .fingerprint;
+
+    let head = StdCommand::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .map_err(|error| VaultError::Storage(format!("cannot read Git HEAD: {error}")))?;
+    if !head.status.success() {
+        return Err(git_command_error("Git HEAD inspection", &head));
+    }
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    if head.is_empty() || !head.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return Err(VaultError::Blocked(format!(
+            "Git HEAD is invalid for {}",
+            worktree.display()
+        )));
+    }
+
+    let branch = StdCommand::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .map_err(|error| VaultError::Storage(format!("cannot read Git branch: {error}")))?;
+    let branch = if branch.status.success() {
+        Some(String::from_utf8_lossy(&branch.stdout).trim().to_owned())
+    } else if branch.status.code() == Some(1) {
+        None
+    } else {
+        return Err(git_command_error("Git branch inspection", &branch));
+    };
+
+    Ok(GitWorktreeState {
+        git_dir,
+        common_dir: canonical_common,
+        head,
+        branch,
+        admin_fingerprint,
+    })
+}
+
+fn ensure_regular_or_missing(path: &Path) -> Result<(), VaultError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(VaultError::Storage(format!(
+                "backup output is not a regular file: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(VaultError::Storage(error.to_string())),
+    }
+}
+
+fn write_synced_file(path: &Path, content: &[u8]) -> Result<(), VaultError> {
+    ensure_regular_or_missing(path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            VaultError::Storage(format!("cannot create {}: {error}", parent.display()))
+        })?;
+    }
+    let mut file = fs::File::create(path).map_err(|error| {
+        VaultError::Storage(format!("cannot create {}: {error}", path.display()))
+    })?;
+    file.write_all(content)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| VaultError::Storage(format!("cannot persist {}: {error}", path.display())))
+}
+
+fn git_stdout_to_file(
+    worktree: &Path,
+    arguments: &[&str],
+    target: &Path,
+    action: &str,
+) -> Result<(), VaultError> {
+    ensure_regular_or_missing(target)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            VaultError::Storage(format!("cannot create {}: {error}", parent.display()))
+        })?;
+    }
+    let output_file = fs::File::create(target).map_err(|error| {
+        VaultError::Storage(format!("cannot create {}: {error}", target.display()))
+    })?;
+    let output = StdCommand::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(arguments)
+        .stdout(Stdio::from(output_file))
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| VaultError::Storage(format!("cannot run {action}: {error}")))?;
+    if !output.status.success() {
+        return Err(git_command_error(action, &output));
+    }
+    fs::File::open(target)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| VaultError::Storage(format!("cannot sync {}: {error}", target.display())))
+}
+
+fn backup_git_worktree_recovery(
+    worktree: &Path,
+    recovery_root: &Path,
+) -> Result<GitWorktreeState, VaultError> {
+    let state = inspect_linked_git_worktree(worktree)?;
+    fs::create_dir_all(recovery_root).map_err(|error| {
+        VaultError::Storage(format!(
+            "cannot create Git recovery directory {}: {error}",
+            recovery_root.display()
+        ))
+    })?;
+    backup_worktree_directory(&state.git_dir, &recovery_root.join("admin"))?;
+
+    let bundle = recovery_root.join("repository.bundle");
+    ensure_regular_or_missing(&bundle)?;
+    let bundle_temporary = recovery_root.join("repository.bundle.tmp");
+    ensure_regular_or_missing(&bundle_temporary)?;
+    if bundle_temporary.exists() {
+        fs::remove_file(&bundle_temporary).map_err(|error| {
+            VaultError::Storage(format!(
+                "cannot replace {}: {error}",
+                bundle_temporary.display()
+            ))
+        })?;
+    }
+    let created = StdCommand::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["bundle", "create"])
+        .arg(&bundle_temporary)
+        .arg("HEAD")
+        .output()
+        .map_err(|error| VaultError::Storage(format!("cannot create Git bundle: {error}")))?;
+    if !created.status.success() {
+        return Err(git_command_error("Git recovery bundle creation", &created));
+    }
+    fs::File::open(&bundle_temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| VaultError::Storage(format!("cannot sync Git bundle: {error}")))?;
+    let verified = StdCommand::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["bundle", "verify"])
+        .arg(&bundle_temporary)
+        .output()
+        .map_err(|error| VaultError::Storage(format!("cannot verify Git bundle: {error}")))?;
+    if !verified.status.success() {
+        return Err(git_command_error(
+            "Git recovery bundle verification",
+            &verified,
+        ));
+    }
+    if bundle.exists() {
+        fs::remove_file(&bundle).map_err(|error| {
+            VaultError::Storage(format!("cannot replace {}: {error}", bundle.display()))
+        })?;
+    }
+    fs::rename(&bundle_temporary, &bundle).map_err(|error| {
+        VaultError::Storage(format!("cannot publish Git recovery bundle: {error}"))
+    })?;
+
+    git_stdout_to_file(
+        worktree,
+        &["diff", "--cached", "--binary", "HEAD"],
+        &recovery_root.join("staged.patch"),
+        "Git staged-state backup",
+    )?;
+    let manifest = serde_json::to_vec_pretty(&json!({
+        "version": 1,
+        "original_worktree": worktree.display().to_string(),
+        "common_git_dir": state.common_dir.display().to_string(),
+        "git_admin_backup": "admin",
+        "head": state.head,
+        "branch": state.branch,
+        "bundle": "repository.bundle",
+        "staged_patch": "staged.patch",
+    }))
+    .map_err(|error| VaultError::Storage(format!("cannot serialize Git recovery data: {error}")))?;
+    write_synced_file(&recovery_root.join("manifest.json"), &manifest)?;
+    let current = inspect_linked_git_worktree(worktree)?;
+    if current != state {
+        return Err(VaultError::StalePreview);
+    }
+    Ok(state)
+}
+
+fn remove_linked_git_worktree(
+    worktree: &Path,
+    expected: &GitWorktreeState,
+) -> Result<(), VaultError> {
+    let state = inspect_linked_git_worktree(worktree)?;
+    if &state != expected {
+        return Err(VaultError::StalePreview);
+    }
+    let removed = StdCommand::new("git")
+        .arg("--git-dir")
+        .arg(&state.common_dir)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree)
+        .output()
+        .map_err(|error| {
+            VaultError::Storage(format!(
+                "cannot remove Git worktree {}: {error}",
+                worktree.display()
+            ))
+        })?;
+    if !removed.status.success() {
+        return Err(git_command_error("Git worktree removal", &removed));
+    }
+    Ok(())
+}
+
+fn cleanup_unreferenced_worktree(
+    codex_home: &Path,
+    backup_root: &Path,
+    candidate: &MaintenanceCandidate,
+) -> Result<(), VaultError> {
+    let source = PathBuf::from(&candidate.detail);
+    let worktrees_root = codex_home.join("worktrees");
+    if !source.is_absolute() || source.parent() != Some(worktrees_root.as_path()) {
+        return Err(VaultError::Blocked(format!(
+            "worktree cleanup path is outside the expected root: {}",
+            source.display()
+        )));
+    }
+    let canonical_root = fs::canonicalize(&worktrees_root).map_err(|error| {
+        VaultError::Blocked(format!(
+            "cannot resolve worktree root {}: {error}",
+            worktrees_root.display()
+        ))
+    })?;
+    let canonical_source = fs::canonicalize(&source).map_err(|error| {
+        VaultError::Blocked(format!(
+            "cannot resolve worktree container {}: {error}",
+            source.display()
+        ))
+    })?;
+    if canonical_source.parent() != Some(canonical_root.as_path()) {
+        return Err(VaultError::Blocked(format!(
+            "worktree cleanup path escaped its physical root: {}",
+            source.display()
+        )));
+    }
+    let current = directory_snapshot(&source).map_err(VaultError::Blocked)?;
+    if current.fingerprint != candidate.fingerprint {
+        return Err(VaultError::StalePreview);
+    }
+    let name = source
+        .file_name()
+        .ok_or_else(|| VaultError::Blocked("worktree container has no name".into()))?;
+    let target = backup_root.join("worktrees").join(name);
+    let linked_worktrees = linked_worktree_roots(&source)?;
+    backup_worktree_directory(&source, &target)?;
+    let mut git_states = Vec::new();
+    for worktree in &linked_worktrees {
+        let relative = worktree.strip_prefix(&source).map_err(|_| {
+            VaultError::Blocked("Git worktree escaped its cleanup container".into())
+        })?;
+        let recovery_name = if relative.as_os_str().is_empty() {
+            Path::new("_root")
+        } else {
+            relative
+        };
+        let state = backup_git_worktree_recovery(
+            worktree,
+            &backup_root
+                .join("git-worktrees")
+                .join(name)
+                .join(recovery_name),
+        )?;
+        git_states.push((worktree.clone(), state));
+    }
+    let after_backup = directory_snapshot(&source).map_err(VaultError::Blocked)?;
+    if after_backup.fingerprint != candidate.fingerprint {
+        return Err(VaultError::StalePreview);
+    }
+    for (worktree, state) in git_states {
+        remove_linked_git_worktree(&worktree, &state)?;
+    }
+    if source.exists() {
+        fs::remove_dir_all(&source).map_err(|error| {
+            VaultError::Storage(format!("cannot remove {}: {error}", source.display()))
+        })?;
+    }
     Ok(())
 }
 
@@ -2799,9 +3602,20 @@ mod tests {
         fs::create_dir_all(orphan.parent().unwrap()).unwrap();
         fs::write(&rollout, b"current\n").unwrap();
         fs::write(&orphan, b"orphan\n").unwrap();
+        let owned_worktree = home.path().join("worktrees/owned/project");
+        let orphan_worktree = home.path().join("worktrees/orphaned");
+        fs::create_dir_all(&owned_worktree).unwrap();
+        fs::create_dir_all(&orphan_worktree).unwrap();
+        fs::write(orphan_worktree.join("scratch.txt"), b"recover me\n").unwrap();
         let database = home.path().join("state_5.sqlite");
         create_catalog_database(&database, &rollout);
         let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE threads SET cwd=?1 WHERE id='root'",
+                [owned_worktree.to_string_lossy().as_ref()],
+            )
+            .unwrap();
         connection
             .execute(
                 "INSERT INTO thread_spawn_edges VALUES ('gone-parent', 'gone-child')",
@@ -2830,12 +3644,90 @@ mod tests {
                 .count(),
             1
         );
+        let worktrees = discovery
+            .candidates
+            .iter()
+            .filter(|value| value.kind == MaintenanceKind::UnreferencedWorktree)
+            .collect::<Vec<_>>();
+        assert_eq!(worktrees.len(), 1);
+        assert_eq!(worktrees[0].detail, orphan_worktree.display().to_string());
         assert!(
             !discovery
                 .candidates
                 .iter()
                 .any(|value| value.kind == MaintenanceKind::MissingRolloutThread)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_cwd_ownership_survives_a_symlinked_codex_home() {
+        let root = tempfile::tempdir().unwrap();
+        let physical_home = root.path().join("physical-home");
+        let linked_home = root.path().join("linked-home");
+        fs::create_dir_all(&physical_home).unwrap();
+        std::os::unix::fs::symlink(&physical_home, &linked_home).unwrap();
+
+        let owned = physical_home.join("worktrees/owned/project");
+        let orphaned = physical_home.join("worktrees/orphaned");
+        fs::create_dir_all(&owned).unwrap();
+        fs::create_dir_all(&orphaned).unwrap();
+        let rollout = linked_home.join("sessions/2026/09/22/rollout-root.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(&rollout, b"{}\n").unwrap();
+        let database = linked_home.join("state_5.sqlite");
+        create_catalog_database(&database, &rollout);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE threads SET cwd=?1 WHERE id='root'",
+                [owned.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let catalog = read_thread_catalog(&database).unwrap();
+        let worktrees = discover_maintenance(&linked_home, &database, &catalog)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .filter(|value| value.kind == MaintenanceKind::UnreferencedWorktree)
+            .collect::<Vec<_>>();
+        assert_eq!(worktrees.len(), 1);
+        assert_eq!(
+            worktrees[0].detail,
+            linked_home.join("worktrees/orphaned").display().to_string()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abnormal_git_marker_blocks_worktree_cleanup() {
+        let home = tempfile::tempdir().unwrap();
+        let container = home.path().join("worktrees/orphaned");
+        let worktree = container.join("repository");
+        fs::create_dir_all(&worktree).unwrap();
+        std::os::unix::fs::symlink(home.path().join("outside-git"), worktree.join(".git")).unwrap();
+        let rollout = home.path().join("sessions/2026/09/22/rollout-root.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(&rollout, b"{}\n").unwrap();
+        let database = home.path().join("state_5.sqlite");
+        create_catalog_database(&database, &rollout);
+        let catalog = read_thread_catalog(&database).unwrap();
+        let candidate = discover_maintenance(home.path(), &database, &catalog)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .find(|value| value.kind == MaintenanceKind::UnreferencedWorktree)
+            .unwrap();
+
+        let result = cleanup_unreferenced_worktree(
+            home.path(),
+            &home.path().join("codex-vault-backups/test-worktree"),
+            &candidate,
+        );
+        assert!(matches!(result, Err(VaultError::Blocked(_))));
+        assert!(container.is_dir());
     }
 
     #[test]
@@ -2871,6 +3763,23 @@ mod tests {
                 .is_file()
         );
 
+        let worktree = home.path().join("worktrees/orphaned");
+        fs::create_dir_all(worktree.join("project")).unwrap();
+        fs::write(worktree.join("project/changes.txt"), b"uncommitted\n").unwrap();
+        let catalog = read_thread_catalog(&database).unwrap();
+        let discovery = discover_maintenance(home.path(), &database, &catalog).unwrap();
+        let worktree_candidate = discovery
+            .candidates
+            .iter()
+            .find(|value| value.kind == MaintenanceKind::UnreferencedWorktree)
+            .unwrap();
+        cleanup_unreferenced_worktree(home.path(), &backup, worktree_candidate).unwrap();
+        assert!(!worktree.exists());
+        assert_eq!(
+            fs::read(backup.join("worktrees/orphaned/project/changes.txt")).unwrap(),
+            b"uncommitted\n"
+        );
+
         fs::remove_file(&rollout).unwrap();
         let catalog = read_thread_catalog(&database).unwrap();
         let discovery = discover_maintenance(home.path(), &database, &catalog).unwrap();
@@ -2898,6 +3807,106 @@ mod tests {
         let index = fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
         assert!(!index.contains("\"root\""));
         assert!(index.contains("\"keep\""));
+    }
+
+    #[test]
+    fn orphan_git_worktree_cleanup_preserves_changes_and_registration() {
+        fn run_git(directory: &Path, arguments: &[&str]) -> std::process::Output {
+            let output = StdCommand::new("git")
+                .arg("-C")
+                .arg(directory)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                arguments,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let repository = home.path().join("repository");
+        fs::create_dir_all(&repository).unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.name", "Codex Vault Test"]);
+        run_git(
+            &repository,
+            &["config", "user.email", "codex-vault@example.invalid"],
+        );
+        fs::write(repository.join("tracked.txt"), b"original\n").unwrap();
+        run_git(&repository, &["add", "tracked.txt"]);
+        run_git(&repository, &["commit", "-m", "fixture"]);
+
+        let container = home.path().join("worktrees/orphaned");
+        let worktree = container.join("repository");
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                worktree.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        );
+        fs::write(worktree.join("tracked.txt"), b"unique commit\n").unwrap();
+        run_git(&worktree, &["add", "tracked.txt"]);
+        run_git(&worktree, &["commit", "-m", "detached fixture"]);
+        let unique_head =
+            String::from_utf8_lossy(&run_git(&worktree, &["rev-parse", "HEAD"]).stdout)
+                .trim()
+                .to_owned();
+        fs::write(worktree.join("tracked.txt"), b"staged only\n").unwrap();
+        run_git(&worktree, &["add", "tracked.txt"]);
+        fs::write(worktree.join("tracked.txt"), b"unique commit\n").unwrap();
+        fs::write(worktree.join("untracked.txt"), b"also preserve\n").unwrap();
+
+        let rollout = home.path().join("sessions/2026/09/22/rollout-root.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(&rollout, b"{}\n").unwrap();
+        let database = home.path().join("state_5.sqlite");
+        create_catalog_database(&database, &rollout);
+        let catalog = read_thread_catalog(&database).unwrap();
+        let candidate = discover_maintenance(home.path(), &database, &catalog)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .find(|value| value.kind == MaintenanceKind::UnreferencedWorktree)
+            .unwrap();
+        let backup = home.path().join("codex-vault-backups/test-worktree");
+        cleanup_unreferenced_worktree(home.path(), &backup, &candidate).unwrap();
+
+        assert!(!container.exists());
+        assert_eq!(
+            fs::read(backup.join("worktrees/orphaned/repository/tracked.txt")).unwrap(),
+            b"unique commit\n"
+        );
+        assert_eq!(
+            fs::read(backup.join("worktrees/orphaned/repository/untracked.txt")).unwrap(),
+            b"also preserve\n"
+        );
+        let recovery = backup.join("git-worktrees/orphaned/repository");
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(recovery.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["head"].as_str(), Some(unique_head.as_str()));
+        assert_eq!(manifest["branch"], Value::Null);
+        assert!(recovery.join("admin/HEAD").is_file());
+        assert!(recovery.join("admin/index").is_file());
+        let staged = fs::read_to_string(recovery.join("staged.patch")).unwrap();
+        assert!(staged.contains("+staged only"));
+        let bundle = recovery.join("repository.bundle");
+        let bundle_heads = run_git(
+            &repository,
+            &["bundle", "list-heads", bundle.to_string_lossy().as_ref()],
+        );
+        assert!(String::from_utf8_lossy(&bundle_heads.stdout).contains(&unique_head));
+        let listing = run_git(&repository, &["worktree", "list", "--porcelain"]);
+        assert!(
+            !String::from_utf8_lossy(&listing.stdout).contains(&worktree.display().to_string())
+        );
     }
 
     #[test]
@@ -3174,7 +4183,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn missing_subagent_parents_are_hydrated_and_scoped_to_interactive_trees() {
+    async fn missing_subagent_parents_are_hydrated_and_scoped_to_manageable_trees() {
         let active = serde_json::to_string(&serde_json::from_str::<Value>(r#"{"id":3,"result":{"data":[
             {"id":"root-a","cwd":"/tmp","recencyAt":5,"isPinned":false,"source":"cli","status":{"type":"idle"}},
             {"id":"child-in","cwd":"/tmp","recencyAt":4,"isPinned":false,"source":{"subAgent":"review"},"status":{"type":"idle"}},
@@ -3191,7 +4200,7 @@ mod tests {
                 printf '%s' "$second_read" | grep -q '"includeTurns":false' || exit 92;
                 printf '%s\n' '{{"id":6,"result":{{"thread":{{"id":"child-out","cwd":"/tmp","recencyAt":1,"isPinned":false,"parentThreadId":"exec-root","source":{{"subAgent":"review"}},"status":{{"type":"idle"}}}}}}}}';
                 printf '%s\n' '{{"id":5,"result":{{"thread":{{"id":"child-in","cwd":"/tmp","recencyAt":4,"isPinned":false,"parentThreadId":"root-a","source":{{"subAgent":"review"}},"status":{{"type":"idle"}}}}}}}}';
-                IFS= read -r line; printf '%s\n' '{{"id":7,"result":{{"data":[{{"id":"child-in","cwd":"/tmp","recencyAt":4,"isPinned":false,"parentThreadId":"root-a","source":{{"subAgent":"review"}},"status":{{"type":"idle"}}}}],"nextCursor":null}}}}';
+                IFS= read -r line; printf '%s\n' '{{"id":7,"result":{{"data":[{{"id":"child-out","cwd":"/tmp","recencyAt":1,"isPinned":false,"parentThreadId":"exec-root","source":{{"subAgent":"review"}},"status":{{"type":"idle"}}}}],"nextCursor":null}}}}';
                 IFS= read -r line; printf '%s\n' '{{"id":8,"result":{{"data":[],"nextCursor":null}}}}';
                 IFS= read -r line; printf '%s\n' '{{"id":9,"result":{{"data":[],"nextCursor":null}}}}';
                 IFS= read -r line; printf '%s\n' '{active_10}';
@@ -3210,14 +4219,26 @@ mod tests {
             .iter()
             .map(|node| node.id.as_str())
             .collect::<BTreeSet<_>>();
-        assert_eq!(ids, BTreeSet::from(["child-in", "root-a", "root-b"]));
+        assert_eq!(
+            ids,
+            BTreeSet::from(["child-in", "child-out", "exec-root", "root-a", "root-b"])
+        );
         let trees = crate::domain::build_trees(&snapshot);
-        assert_eq!(trees.len(), 2);
+        assert_eq!(trees.len(), 3);
         assert!(trees.iter().all(|tree| tree.protection.is_empty()));
         assert_eq!(
             trees
                 .iter()
                 .find(|tree| tree.root_id == "root-a")
+                .unwrap()
+                .nodes
+                .len(),
+            2
+        );
+        assert_eq!(
+            trees
+                .iter()
+                .find(|tree| tree.root_id == "exec-root")
                 .unwrap()
                 .nodes
                 .len(),

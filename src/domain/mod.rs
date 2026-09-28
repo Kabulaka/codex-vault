@@ -115,8 +115,8 @@ pub enum SessionSource {
 }
 
 impl SessionSource {
-    pub fn is_interactive_root(&self) -> bool {
-        matches!(self, Self::Cli | Self::Vscode)
+    pub fn is_manageable_root(&self) -> bool {
+        matches!(self, Self::Cli | Self::Vscode | Self::Exec)
     }
 
     pub fn is_known(&self) -> bool {
@@ -335,7 +335,7 @@ pub fn build_trees(snapshot: &ScanSnapshot) -> Vec<SessionTree> {
     let roots = snapshot
         .nodes
         .iter()
-        .filter(|node| node.parent_id.is_none() && node.source.is_interactive_root())
+        .filter(|node| node.parent_id.is_none() && node.source.is_manageable_root())
         .collect::<Vec<_>>();
     let mut children = BTreeMap::<&str, Vec<&SessionNode>>::new();
     for node in &snapshot.nodes {
@@ -486,6 +486,7 @@ impl Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MaintenanceKind {
     UnreferencedRollout,
+    UnreferencedWorktree,
     StaleSpawnEdge,
     MissingRolloutThread,
 }
@@ -494,6 +495,7 @@ impl MaintenanceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::UnreferencedRollout => "unreferenced_rollout",
+            Self::UnreferencedWorktree => "unreferenced_worktree",
             Self::StaleSpawnEdge => "stale_spawn_edge",
             Self::MissingRolloutThread => "missing_rollout_thread",
         }
@@ -665,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_only_interactive_roots_with_all_descendants() {
+    fn builds_cli_vscode_and_exec_roots_with_all_descendants() {
         let snapshot = ScanSnapshot {
             nodes: vec![
                 node("root", None, SessionSource::Cli, false),
@@ -677,9 +679,23 @@ mod tests {
             diagnostics: vec![],
         };
         let trees = build_trees(&snapshot);
-        assert_eq!(trees.len(), 1);
-        assert_eq!(trees[0].nodes.len(), 2);
-        assert_eq!(trees[0].root_id, "root");
+        assert_eq!(trees.len(), 2);
+        assert_eq!(
+            trees
+                .iter()
+                .map(|tree| tree.root_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["exec", "root"])
+        );
+        assert_eq!(
+            trees
+                .iter()
+                .find(|tree| tree.root_id == "root")
+                .unwrap()
+                .nodes
+                .len(),
+            2
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 asyncapi: 3.0.0
 info:
   title: Codex Vault app-server protocol subset
-  version: 1.5.0
+  version: 1.6.0
   description: >-
     Capability-driven JSON-RPC subset used by Codex Vault. Managed mode uses
     JSONL over app-server stdio. Attached mode performs the app-server
@@ -18,9 +18,9 @@ info:
     commands protect the affected scope. A catalogued ID omitted by thread/list
     is read with includeTurns=false; unavailable runtime metadata remains
     protected rather than disappearing. Relationship or source failures with a
-    proven tree scope protect that tree; ambiguity that may affect any
-    interactive tree disables all writes. Incomplete observations remain
-    unknown.
+    proven tree scope protect that tree; ambiguity that may affect any managed
+    CLI, VS Code, or exec root tree disables all writes. Incomplete
+    observations remain unknown.
 defaultContentType: application/json
 channels:
   clientToServer:

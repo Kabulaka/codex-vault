@@ -13,7 +13,7 @@ Codex databases or session files.
 
 | Area | claude-code-cleaner | Codex Vault |
 |---|---|---|
-| Primary object | Claude Code files, caches, metrics, and orphaned project data | Interactive Codex root tasks and every spawned descendant |
+| Primary object | Claude Code files, caches, metrics, and orphaned project data | Interactive and `codex exec` root tasks with every spawned descendant |
 | Archive | No session archive lifecycle | Archive and restore are first-class operations through the official Codex CLI |
 | Age | 30 days is the initial default and can be adjusted | First run uses 30 days, then remembers the last `1d`, `7d`, `30d`, or custom RFC3339 cutoff |
 | Selection | Cleanup categories and projects | `A` safely selects every eligible, unprotected tree in the current filter; `Space` toggles one tree |
@@ -21,11 +21,11 @@ Codex databases or session files.
 | Deletion | Deletes selected filesystem data | Requires a fully archived tree and typing the exact node count |
 | Privacy | Scans cleanup targets | Uses metadata only and never reads message turns |
 
-Independent `codex exec` records are excluded. Interactive CLI and VS Code
-roots are included together with descendants from the SQLite relationship
-catalog. App-server metadata may enrich that catalog but cannot silently remove
-historical tasks from it. Missing parents, unsafe rollout paths, unavailable
-runtime state, or incompatible schemas protect the affected scope.
+Interactive CLI, VS Code, and independent `codex exec` roots are included
+together with descendants from the SQLite relationship catalog. App-server
+metadata may enrich that catalog but cannot silently remove historical tasks
+from it. Missing parents, unsafe rollout paths, unavailable runtime state, or
+incompatible schemas protect the affected scope.
 
 The SQLite filenames and schemas are versioned Codex implementation details,
 not a public compatibility promise. Codex Vault probes the required task,
@@ -83,6 +83,7 @@ and [troubleshooting](https://learn.chatgpt.com/docs/reference/troubleshooting#f
 主会话整理仍显示五个阶段：**扫描 → 筛选 → 选择 → 预览 → 结果**。扫描和执行期间
 显示进度；`Enter` 进入下一阶段，`Esc` 返回。顶部持续显示匹配、可操作、
 已阻止、已选择和影响节点数量，底部只显示当前页面可用的快捷键，`?` 可打开完整帮助。
+交互式 CLI、VS Code 和独立 `codex exec` 生成的根会话都会进入同一套受保护的整理流程。
 
 1. 在“扫描”确认发现的会话树和诊断。存在可证明的脏数据时按 `g` 打开独立复选清单。
 2. 在“筛选”用 `↑/↓` 选择时间、状态或项目，用 `←/→` 在图形预设间切换；时间支持
@@ -99,11 +100,14 @@ and [troubleshooting](https://learn.chatgpt.com/docs/reference/troubleshooting#f
    `↑/↓` 滚动。
 
 脏数据清理使用单独的 **清单 → 预览 → 执行 → 重扫** 流程。清单只包括任务目录未引用
-的 JSONL、子任务已不在目录中的陈旧关系，以及正文路径已不存在的目录记录。`Space`
-逐项复选，`1` / `2` / `3` 按类别切换，`A` 全选。执行前会把原始文件和 SQLite 在线
-备份保存到 `$CODEX_HOME/codex-vault-backups/<batch-id>/`；SQLite 修改使用事务，结束后
-重新扫描验证。备份不会被解析或展示，工具不会读取 `auth.json`，也不会直接删除
-SQLite 的 `-wal` / `-shm` 文件。
+的 JSONL、子任务已不在目录中的陈旧关系、正文路径已不存在的目录记录，以及
+`$CODEX_HOME/worktrees/` 下没有任何目录 `cwd` 引用的工作树容器。`Space` 逐项复选，
+`1` / `2` / `3` / `4` 按类别切换，`A` 全选。执行前会把原始文件、工作树内容和
+SQLite 在线备份保存到 `$CODEX_HOME/codex-vault-backups/<batch-id>/`；已注册的 Git
+worktree 会额外保存 Git 管理目录、HEAD、分支、bundle 和 staged binary patch，然后通过
+`git worktree remove --force` 移除；SQLite 修改使用事务，结束后重新扫描验证。
+备份不会被解析或展示，工具不会读取 `auth.json`，也不会直接删除 SQLite 的
+`-wal` / `-shm` 文件。
 
 “缺少 Codex 读写能力”不是等待一段时间后自动获得的权限，而是当前状态库模式、
 关系、正文路径、app-server 运行态或官方 CLI 命令不足以安全完成操作。此时 Codex
@@ -122,7 +126,7 @@ Vault 会保护受影响的树；升级到兼容版本并重新扫描后才会�
 | `Space` | Select or unselect the current eligible complete tree |
 | `Enter` / `Esc` | Move forward or back through the guarded flow |
 | `g` | Open the dirty-data checklist from the scan page |
-| `1` / `2` / `3` | Toggle orphan rollouts, stale relations, or missing-rollout tasks in cleanup |
+| `1` / `2` / `3` / `4` | Toggle orphan rollouts, stale relations, missing-rollout tasks, or orphan worktrees in cleanup |
 | `t` | Cycle all, 1, 7, and 30 day cutoffs |
 | `c` | Enter an absolute RFC3339 cutoff |
 | `/` | Search text or combine `id:`, `title:`, `project:`, `cwd:`, `provider:`, and `model:` filters |

@@ -542,6 +542,11 @@ where
             candidates,
             MaintenanceKind::MissingRolloutThread,
         ),
+        KeyCode::Char('4') => toggle_maintenance_kind(
+            &mut state.maintenance_selected,
+            candidates,
+            MaintenanceKind::UnreferencedWorktree,
+        ),
         KeyCode::Enter => {
             let plan = service.maintenance_preview(&state.maintenance_selected);
             if plan.candidates.is_empty() {
@@ -1952,7 +1957,7 @@ fn draw_maintenance<G, S>(
     }
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(3)])
+        .constraints([Constraint::Length(5), Constraint::Min(3)])
         .split(area);
     let selected_bytes = candidates
         .iter()
@@ -1963,6 +1968,7 @@ fn draw_maintenance<G, S>(
         MaintenanceKind::UnreferencedRollout,
         MaintenanceKind::StaleSpawnEdge,
         MaintenanceKind::MissingRolloutThread,
+        MaintenanceKind::UnreferencedWorktree,
     ]
     .map(|kind| {
         candidates
@@ -1977,13 +1983,18 @@ fn draw_maintenance<G, S>(
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(format!(
-                "1 {}={}  2 {}={}  3 {}={}  ·  {}={} · {}",
+                "1 {}={}  2 {}={}",
                 state.catalog.text("maintenance_rollouts"),
                 counts[0],
                 state.catalog.text("maintenance_edges"),
-                counts[1],
+                counts[1]
+            )),
+            Line::from(format!(
+                "3 {}={}  4 {}={}  ·  {}={} · {}",
                 state.catalog.text("maintenance_threads"),
                 counts[2],
+                state.catalog.text("maintenance_worktrees"),
+                counts[3],
                 state.catalog.text("selected"),
                 state.maintenance_selected.len(),
                 human_bytes(selected_bytes)
@@ -2579,6 +2590,7 @@ fn action_text(catalog: &Catalog, action: Action) -> &str {
 fn maintenance_kind_text(catalog: &Catalog, kind: MaintenanceKind) -> &str {
     match kind {
         MaintenanceKind::UnreferencedRollout => catalog.text("maintenance_rollout"),
+        MaintenanceKind::UnreferencedWorktree => catalog.text("maintenance_worktree"),
         MaintenanceKind::StaleSpawnEdge => catalog.text("maintenance_edge"),
         MaintenanceKind::MissingRolloutThread => catalog.text("maintenance_thread"),
     }
