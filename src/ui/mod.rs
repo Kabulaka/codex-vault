@@ -24,7 +24,7 @@ use crate::{
     domain::{
         Action, Cutoff, Filter, HistoryEntry, ItemResult, MaintenanceKind, MaintenancePlan,
         OperationPreview, OperationResult, OperationStore, Preferences, ProtectionReason,
-        SessionGateway, SessionTree, VaultError,
+        ScanNotice, SessionGateway, SessionTree, VaultError,
     },
     i18n::Catalog,
 };
@@ -130,6 +130,10 @@ impl UiState {
 
     fn reset_selection(&mut self) {
         self.selected.clear();
+        self.reset_view();
+    }
+
+    fn reset_view(&mut self) {
         self.index = 0;
         self.preview = None;
         self.preview_offset = 0;
@@ -426,7 +430,11 @@ where
         }
         _ => return,
     }
-    state.reset_selection();
+    if state.filter_focus == 2 {
+        state.reset_view();
+    } else {
+        state.reset_selection();
+    }
     persist_preferences(state, service);
 }
 
@@ -495,7 +503,7 @@ where
         .position(|value| value == &state.filter.project)
         .unwrap_or(0);
     state.filter.project = values[cycle_index(current, values.len(), forward)].clone();
-    state.reset_selection();
+    state.reset_view();
     state.message.clear();
     persist_preferences(state, service);
 }
@@ -619,7 +627,7 @@ where
                     state.selected.len(),
                     state.catalog.text("trees_selected"),
                     state.catalog.text("impacted"),
-                    scope.impacted
+                    service.preview(&state.selected, action).impacted_count
                 )
             };
         } else {
@@ -669,7 +677,9 @@ where
                 state.message = state.catalog.text("choose_action_first").into();
                 return;
             };
-            let scope = scope_summary(service, &state.filter, action);
+            let mut all_projects = state.filter.clone();
+            all_projects.project = None;
+            let scope = scope_summary(service, &all_projects, action);
             state.selected.retain(|root| scope.eligible.contains(root));
             if state.selected.is_empty() {
                 state.message = state.catalog.text("select_one_first").into();
@@ -1148,7 +1158,7 @@ fn action_candidate(tree: &SessionTree, action: Action) -> bool {
 }
 
 fn select_all_eligible(selected: &mut BTreeSet<String>, scope: &ScopeSummary) {
-    selected.clone_from(&scope.eligible);
+    selected.extend(scope.eligible.iter().cloned());
 }
 
 fn toggle_selection(selected: &mut BTreeSet<String>, root: &str, eligible: bool) -> bool {
@@ -1262,9 +1272,13 @@ where
             Constraint::Length(5),
         ])
         .split(frame.area());
+    let mut scope_filter = state.filter.clone();
+    if state.screen == Screen::Preview {
+        scope_filter.project = None;
+    }
     let scope = state
         .action
-        .map(|action| scope_summary(service, &state.filter, action));
+        .map(|action| scope_summary(service, &scope_filter, action));
     draw_header(frame, areas[0], state, service, scope.as_ref());
     match state.screen {
         Screen::Scan => draw_scan(frame, areas[1], state, service),
@@ -1322,7 +1336,10 @@ fn draw_header<G, S>(
             step_line.push(Span::raw("  ›  "));
         }
     }
-    let matched = service.filtered(&state.filter).len();
+    let matched = scope.map_or_else(
+        || service.filtered(&state.filter).len(),
+        |scope| scope.matched,
+    );
     let (eligible, blocked, impacted) = scope.map_or((0, 0, 0), |scope| {
         let selected_impacted = state
             .action
@@ -1351,7 +1368,7 @@ fn draw_header<G, S>(
     );
     let selection_stats = format!(
         "{}={}  {}={}",
-        state.catalog.text("selected"),
+        state.catalog.text("selected_total"),
         state.selected.len(),
         state.catalog.text("impacted"),
         impacted
@@ -1418,6 +1435,12 @@ where
     if maintenance_count > 0 {
         lines.push(Line::from(Span::styled(
             state.catalog.text("maintenance_open_hint"),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+    for notice in service.notices() {
+        lines.push(Line::from(Span::styled(
+            scan_notice_text(&state.catalog, notice),
             Style::default().fg(Color::Cyan),
         )));
     }
@@ -1925,7 +1948,10 @@ fn draw_select<G, S>(
                         "{} · {} {}/{}",
                         state.catalog.text("step_select"),
                         state.catalog.text("selected"),
-                        state.selected.len(),
+                        trees
+                            .iter()
+                            .filter(|tree| state.selected.contains(&tree.root_id))
+                            .count(),
                         trees.len()
                     ))
                     .title_bottom(state.catalog.text("storage_legend")),
@@ -2111,13 +2137,22 @@ where
         .saturating_add(preview.blocked.len());
     let max_start = total.saturating_sub(height);
     let offset = state.preview_offset.min(max_start);
-    let titles = service
+    let details = service
         .trees()
         .iter()
         .filter_map(|tree| {
             tree.nodes
-                .first()
-                .map(|node| (tree.root_id.as_str(), node.title.as_str()))
+                .iter()
+                .find(|node| node.id == tree.root_id)
+                .map(|node| {
+                    (
+                        tree.root_id.as_str(),
+                        (
+                            node.title.as_str(),
+                            node.project.as_deref().unwrap_or(&node.cwd),
+                        ),
+                    )
+                })
         })
         .collect::<BTreeMap<_, _>>();
     let planned_start = 3;
@@ -2144,16 +2179,20 @@ where
                 state.catalog.text("query"),
                 state.filter.query.as_deref().unwrap_or("*")
             )),
-            2 => Line::from(""),
+            2 => Line::from(state.catalog.text("preview_all_projects")),
             value if value < blocked_start => {
                 let planned = &preview.trees[value - planned_start];
-                let title = titles.get(planned.root_id.as_str()).copied().unwrap_or("-");
+                let (title, project) = details
+                    .get(planned.root_id.as_str())
+                    .copied()
+                    .unwrap_or(("-", "-"));
                 Line::from(format!(
-                    "✓ {} · {} · {}{}",
-                    fit_to_width(title, 36),
+                    "✓ {} · {} · {}{} · {}",
+                    fit_to_width(title, 28),
                     short_id(&planned.root_id),
                     planned.node_ids.len(),
-                    state.catalog.text("nodes")
+                    state.catalog.text("nodes"),
+                    fit_to_width(project, 24)
                 ))
             }
             value => {
@@ -2410,6 +2449,20 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &UiState) {
     );
 }
 
+fn scan_notice_text(catalog: &Catalog, notice: &ScanNotice) -> String {
+    match notice {
+        ScanNotice::UnreferencedRollouts {
+            active,
+            archived,
+            unreferenced,
+        } => catalog
+            .text("scan_unreferenced_notice")
+            .replace("{active}", &active.to_string())
+            .replace("{archived}", &archived.to_string())
+            .replace("{unreferenced}", &unreferenced.to_string()),
+    }
+}
+
 fn draw_footer<G, S>(frame: &mut Frame, area: Rect, state: &UiState, service: &VaultService<G, S>)
 where
     G: SessionGateway,
@@ -2424,6 +2477,11 @@ where
         lines.push(Line::from(Span::styled(
             format!("⚠ {} {diagnostic}", state.catalog.text("readonly_banner")),
             Style::default().fg(Color::Yellow),
+        )));
+    } else if let Some(notice) = service.notices().first() {
+        lines.push(Line::from(Span::styled(
+            format!("ℹ {}", scan_notice_text(&state.catalog, notice)),
+            Style::default().fg(Color::Cyan),
         )));
     }
     lines.push(Line::from(help));
@@ -2739,6 +2797,7 @@ mod tests {
             write_capable: true,
             relation_complete: true,
             diagnostics: Vec::new(),
+            notices: Vec::new(),
         }
     }
 
@@ -2778,7 +2837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_tabs_count_render_and_cycle_without_hidden_selection() {
+    async fn project_tabs_keep_cross_project_selections_through_wraparound_and_preview() {
         let mut snapshot = selectable_snapshot();
         snapshot.nodes[0].project = Some("/work/alpha".into());
         snapshot.nodes[0].cwd = "/work/alpha".into();
@@ -2800,7 +2859,7 @@ mod tests {
 
         assert_eq!(state.filter.project.as_deref(), Some("/work/alpha"));
         assert_eq!(state.preferences.project, state.filter.project);
-        assert!(state.selected.is_empty());
+        assert_eq!(state.selected, BTreeSet::from(["one".into()]));
         assert_eq!(state.index, 0);
         let tabs = project_tabs(&service, &state.filter);
         assert_eq!(
@@ -2847,11 +2906,168 @@ mod tests {
         );
         assert_eq!(state.filter.project.as_deref(), Some("/work/beta"));
         handle_select(
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE),
+            &mut state,
+            &mut service,
+        );
+        assert_eq!(state.selected, BTreeSet::from(["one".into(), "two".into()]));
+        assert!(state.message.contains("影响节点=2"));
+        handle_select(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut state,
+            &mut service,
+        );
+        assert_eq!(state.filter.project, None);
+        handle_select(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut state,
+            &mut service,
+        );
+        assert_eq!(state.filter.project.as_deref(), Some("/work/alpha"));
+        handle_select(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &mut state,
+            &mut service,
+        );
+        assert_eq!(state.filter.project, None);
+        handle_select(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &mut state,
+            &mut service,
+        );
+        assert_eq!(state.filter.project.as_deref(), Some("/work/beta"));
+        handle_select(
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
             &mut state,
             &mut service,
         );
         assert_eq!(state.filter.project.as_deref(), Some("/work/alpha"));
+        assert_eq!(state.selected, BTreeSet::from(["one".into(), "two".into()]));
+        terminal
+            .draw(|frame| draw(frame, &state, &service))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(rendered.contains("跨项目已选择=2"));
+        assert!(rendered.contains("选择·已选择1/1"));
+        handle_select(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &mut service,
+        );
+        assert_eq!(state.screen, Screen::Preview);
+        let preview = state.preview.as_ref().unwrap();
+        assert_eq!(preview.impacted_count, 2);
+        assert_eq!(
+            preview
+                .trees
+                .iter()
+                .map(|tree| tree.root_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["one", "two"])
+        );
+        // TestBackend does not emulate terminal erasure of covered wide cells
+        // when diffing different layouts. Inspect the preview on a fresh buffer.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &state, &service))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(rendered.contains("所有项目的已选会话"), "{rendered}");
+        assert!(rendered.contains("匹配=2"));
+        assert!(rendered.contains("/work/alpha"));
+        assert!(rendered.contains("/work/beta"));
+        handle_preview(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.pending_execution.as_ref().unwrap().0.trees.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cross_project_preview_prunes_protected_stale_and_wrong_action_selections() {
+        for action in [Action::Archive, Action::Restore, Action::Delete] {
+            let mut snapshot = selectable_snapshot();
+            snapshot.nodes[0].project = Some("/work/alpha".into());
+            snapshot.nodes[1].project = Some("/work/beta".into());
+            for node in &mut snapshot.nodes {
+                node.archived = action != Action::Archive;
+            }
+            snapshot.nodes[1].pinned = Some(true);
+            let mut wrong_action = snapshot.nodes[0].clone();
+            wrong_action.id = "wrong-action".into();
+            wrong_action.archived = !wrong_action.archived;
+            snapshot.nodes.push(wrong_action);
+            let mut service = VaultService::new(Gateway { snapshot }, Store);
+            service.refresh().await.unwrap();
+            let mut state = UiState::new(Preferences::default());
+            state.screen = Screen::Select;
+            state.choose_action(action);
+            state.filter.project = Some("/work/beta".into());
+            state.selected = BTreeSet::from([
+                "one".into(),
+                "two".into(),
+                "wrong-action".into(),
+                "missing".into(),
+            ]);
+            handle_select(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+                &mut service,
+            );
+            assert_eq!(state.screen, Screen::Preview);
+            assert_eq!(state.selected, BTreeSet::from(["one".into()]));
+            let preview = state.preview.as_ref().unwrap();
+            assert_eq!(preview.action, action);
+            assert_eq!(preview.trees.len(), 1);
+            assert_eq!(preview.trees[0].root_id, "one");
+            assert_eq!(preview.impacted_count, 1);
+            assert!(state.pending_execution.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn project_navigation_keeps_selection_and_explicit_resets_clear_all_projects() {
+        let mut snapshot = selectable_snapshot();
+        snapshot.nodes[0].project = Some("alpha".into());
+        snapshot.nodes[1].project = Some("beta".into());
+        let mut service = VaultService::new(Gateway { snapshot }, Store);
+        service.refresh().await.unwrap();
+        let mut state = UiState::new(Preferences::default());
+        state.choose_action(Action::Archive);
+        let selected = BTreeSet::from(["one".into(), "two".into()]);
+        state.selected = selected.clone();
+        state.filter_focus = 2;
+        cycle_filter_control(&mut state, &mut service, true);
+        assert_eq!(state.selected, selected);
+        handle_select(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut state,
+            &mut service,
+        );
+        assert!(state.selected.is_empty());
+        for focus in [0, 1] {
+            state.selected = selected.clone();
+            state.filter_focus = focus;
+            cycle_filter_control(&mut state, &mut service, true);
+            assert!(state.selected.is_empty());
+        }
+        state.selected = selected;
+        state.choose_action(Action::Delete);
+        assert!(state.selected.is_empty());
     }
 
     #[tokio::test]
@@ -2949,13 +3165,16 @@ mod tests {
         assert!(!summary.eligible.contains(&outside_filter.root_id));
         assert_eq!(summary.impacted, 1);
         assert_eq!(summary.matched, 2);
-        let mut selected = BTreeSet::from(["stale-selection".into()]);
+        let mut selected = BTreeSet::from(["another-project".into()]);
         select_all_eligible(&mut selected, &summary);
-        assert_eq!(selected, BTreeSet::from(["eligible".into()]));
+        assert_eq!(
+            selected,
+            BTreeSet::from(["another-project".into(), "eligible".into()])
+        );
         assert!(!toggle_selection(&mut selected, "protected", false));
         assert!(!selected.contains("protected"));
         assert!(!toggle_selection(&mut selected, "eligible", true));
-        assert!(selected.is_empty());
+        assert_eq!(selected, BTreeSet::from(["another-project".into()]));
     }
 
     #[test]
@@ -3305,7 +3524,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         let rendered = rendered.replace(' ', "");
-        assert!(rendered.contains("已选择=2"));
+        assert!(rendered.contains("跨项目已选择=2"));
         assert!(rendered.contains("选择·已选择2/2"));
         assert_eq!(rendered.matches("[x]").count(), 2);
 
@@ -3460,6 +3679,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_notices_are_localized_without_readonly_warnings() {
+        for language in [crate::domain::Language::ZhCn, crate::domain::Language::En] {
+            let mut snapshot = selectable_snapshot();
+            snapshot.notices = vec![ScanNotice::UnreferencedRollouts {
+                active: 73,
+                archived: 54,
+                unreferenced: 21,
+            }];
+            let mut service = VaultService::new(Gateway { snapshot }, Store);
+            service.refresh().await.unwrap();
+            assert!(service.diagnostics().is_empty());
+            assert!(
+                service
+                    .trees()
+                    .iter()
+                    .all(|tree| tree.protection.is_empty())
+            );
+            for screen in [Screen::Scan, Screen::Select] {
+                let mut state = UiState::new(Preferences {
+                    language,
+                    ..Preferences::default()
+                });
+                state.choose_action(Action::Archive);
+                state.screen = screen;
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(240, 35)).unwrap();
+                terminal
+                    .draw(|frame| draw(frame, &state, &service))
+                    .unwrap();
+                let rendered = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .replace(' ', "");
+                let expected = scan_notice_text(&state.catalog, &service.notices()[0]);
+                assert!(rendered.contains(&expected.replace(' ', "")));
+                assert!(!rendered.contains("⚠"));
+                assert!(
+                    !rendered.contains(&state.catalog.text("readonly_banner").replace(' ', ""))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn global_pin_failure_is_shown_once_instead_of_on_every_row() {
         let mut snapshot = selectable_snapshot();
         for node in &mut snapshot.nodes {
@@ -3467,6 +3734,11 @@ mod tests {
         }
         snapshot.write_capable = false;
         snapshot.diagnostics = vec!["pin fallback unavailable".into()];
+        snapshot.notices = vec![ScanNotice::UnreferencedRollouts {
+            active: 73,
+            archived: 54,
+            unreferenced: 21,
+        }];
         let mut service = VaultService::new(Gateway { snapshot }, Store);
         service.refresh().await.unwrap();
         let mut state = UiState::new(Preferences::default());
@@ -3487,6 +3759,8 @@ mod tests {
             .replace(' ', "");
 
         assert_eq!(rendered.matches("pinfallbackunavailable").count(), 1);
+        assert!(rendered.contains("⚠"));
+        assert!(!rendered.contains("维护提示"));
         assert!(!rendered.contains("置顶状态未知"));
         assert!(!rendered.contains("缺少必要的app-server写入能力"));
     }

@@ -229,11 +229,21 @@ impl SessionNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanNotice {
+    UnreferencedRollouts {
+        active: usize,
+        archived: usize,
+        unreferenced: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanSnapshot {
     pub nodes: Vec<SessionNode>,
     pub write_capable: bool,
     pub relation_complete: bool,
     pub diagnostics: Vec<String>,
+    pub notices: Vec<ScanNotice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -677,6 +687,7 @@ mod tests {
             write_capable: true,
             relation_complete: true,
             diagnostics: vec![],
+            notices: Vec::new(),
         };
         let trees = build_trees(&snapshot);
         assert_eq!(trees.len(), 2);
@@ -789,6 +800,7 @@ mod tests {
             write_capable: true,
             relation_complete: true,
             diagnostics: vec![],
+            notices: Vec::new(),
         });
         assert_eq!(trees[0].protection, vec![ProtectionReason::WaitingApproval]);
     }
@@ -809,6 +821,7 @@ mod tests {
             write_capable: true,
             relation_complete: true,
             diagnostics: vec![],
+            notices: Vec::new(),
         });
         let protected = trees.iter().find(|tree| tree.root_id == "root-a").unwrap();
         let eligible = trees.iter().find(|tree| tree.root_id == "root-b").unwrap();
@@ -842,6 +855,7 @@ mod tests {
             write_capable: true,
             relation_complete: true,
             diagnostics: vec![],
+            notices: Vec::new(),
         };
         let trees = build_trees(&many_roots);
         assert_eq!(trees.len(), 5_000);
@@ -862,6 +876,7 @@ mod tests {
             write_capable: true,
             relation_complete: true,
             diagnostics: vec![],
+            notices: Vec::new(),
         });
         assert_eq!(deep.len(), 1);
         let impacted = deep.remove(0).impacted_ids(Action::Archive);

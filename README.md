@@ -27,6 +27,13 @@ metadata may enrich that catalog but cannot silently remove historical tasks
 from it. Missing parents, unsafe rollout paths, unavailable runtime state, or
 incompatible schemas protect the affected scope.
 
+Rollout discovery recognizes both `.jsonl` files and Codex's compressed
+`.jsonl.zst` files, including when the catalog retains the original JSONL path.
+Size reporting uses the physical file size, preferring plain JSONL when both
+representations exist. Both representations belong to that catalog entry;
+neither is treated as an orphan, and deletion checks both for residue. Scans
+do not decompress or read message bodies.
+
 The SQLite filenames and schemas are versioned Codex implementation details,
 not a public compatibility promise. Codex Vault probes the required task,
 relationship, provider, model, archive, pin, and rollout-path columns in
@@ -93,7 +100,9 @@ and [troubleshooting](https://learn.chatgpt.com/docs/reference/troubleshooting#f
 3. 在“选择”用 `Tab` / `Shift+Tab` 在“全部”和扫描得到的项目 Tab 间切换，Tab
    会显示当前筛选条件下的会话树数量。再按 `a`、`u` 或 `d` 选择动作；大写 `A`
    会一次选择**当前项目内、适用于当前动作且未受保护**的全部完整会话树；`n` 清空，
-   `Space` 只切换当前树。切换项目、动作或修改筛选会自动清空选择。
+   `Space` 只切换当前树。切换项目保留勾选，`A` 会追加当前项目的可操作会话，
+   `n` 清空所有项目的勾选；按 `Enter` 预览并执行所有项目的已选会话。
+   切换动作或修改时间、状态、搜索条件会自动清空选择，重新扫描也会清空选择。
 4. 在“预览”核对树数和准确节点数，再按 `Enter` 执行。永久删除还必须输入
    屏幕显示的准确节点数。
 5. 在“结果”查看成功、失败、跳过和中断数量以及逐项结果；结果超过一屏时使用

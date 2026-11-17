@@ -5,8 +5,8 @@ use std::{
 
 use crate::domain::{
     Action, Filter, ItemResult, MaintenanceCandidate, MaintenancePlan, OperationPreview,
-    OperationResult, OperationStore, PlannedTree, Preferences, ScanSnapshot, SessionGateway,
-    SessionTree, VaultError, build_trees,
+    OperationResult, OperationStore, PlannedTree, Preferences, ScanNotice, ScanSnapshot,
+    SessionGateway, SessionTree, VaultError, build_trees,
 };
 
 pub struct VaultService<G, S> {
@@ -115,6 +115,13 @@ where
         self.snapshot
             .as_ref()
             .map(|value| value.diagnostics.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn notices(&self) -> &[ScanNotice] {
+        self.snapshot
+            .as_ref()
+            .map(|value| value.notices.as_slice())
             .unwrap_or(&[])
     }
 
@@ -723,6 +730,7 @@ mod tests {
             write_capable: true,
             relation_complete: true,
             diagnostics: vec![],
+            notices: Vec::new(),
         }
     }
 
@@ -937,6 +945,7 @@ mod tests {
             write_capable: true,
             relation_complete: true,
             diagnostics: vec![],
+            notices: Vec::new(),
         };
         for (action, current) in [
             (Action::Archive, snapshot(true)),

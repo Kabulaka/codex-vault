@@ -24,7 +24,8 @@ use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
 
 use crate::domain::{
     Action, MaintenanceAck, MaintenanceCandidate, MaintenanceKind, MutationAck, PortFuture,
-    RuntimeStatus, ScanSnapshot, SessionGateway, SessionNode, SessionSource, VaultError,
+    RuntimeStatus, ScanNotice, ScanSnapshot, SessionGateway, SessionNode, SessionSource,
+    VaultError,
 };
 
 const ALL_SOURCE_KINDS: &[&str] = &[
@@ -857,6 +858,7 @@ impl AppServerClient {
 
     async fn scan_inner(&mut self) -> Result<ScanSnapshot, VaultError> {
         let mut diagnostics = self.capability_diagnostics.clone();
+        let mut notices = Vec::new();
         let mut raw = BTreeMap::<String, (ThreadDto, bool)>::new();
         let mut relation_complete = true;
         let mut storage_complete = true;
@@ -895,10 +897,11 @@ impl AppServerClient {
                             })
                             .count();
                         if orphaned > 0 {
-                            diagnostics.push(format!(
-                                "recursive rollout scan found {} active and {} archived JSONL files; {orphaned} are not referenced by the task catalog",
-                                discovery.active_rollouts, discovery.archived_rollouts
-                            ));
+                            notices.push(ScanNotice::UnreferencedRollouts {
+                                active: discovery.active_rollouts,
+                                archived: discovery.archived_rollouts,
+                                unreferenced: orphaned,
+                            });
                         }
                         self.maintenance_candidates = discovery.candidates;
                     }
@@ -1278,6 +1281,7 @@ impl AppServerClient {
             write_capable,
             relation_complete,
             diagnostics,
+            notices,
         })
     }
 }
@@ -1658,37 +1662,94 @@ fn read_thread_catalog(database: &Path) -> Result<CatalogSnapshot, String> {
     })
 }
 
-fn validate_rollout_path(codex_home: &Path, thread: &CatalogThread) -> Result<u64, String> {
+// The catalog can retain the logical JSONL path after Codex compresses the file.
+// Keep both representations owned by that exact path, including when both exist.
+fn rollout_paths(path: &Path) -> [PathBuf; 2] {
+    let plain = if path.extension().is_some_and(|extension| extension == "zst")
+        && path
+            .with_extension("")
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+    {
+        path.with_extension("")
+    } else {
+        path.to_owned()
+    };
+    let mut compressed = plain.as_os_str().to_os_string();
+    compressed.push(".zst");
+    [plain, PathBuf::from(compressed)]
+}
+
+fn regular_rollout_files(path: &Path) -> io::Result<Vec<(PathBuf, fs::Metadata)>> {
+    // Materialization can publish plain JSONL and remove ZST between our two
+    // metadata reads. Recheck once before declaring both representations absent.
+    for _ in 0..2 {
+        let mut files = Vec::new();
+        for path in rollout_paths(path) {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("rollout path is not a regular file: {}", path.display()),
+                    ));
+                }
+                Ok(metadata) => files.push((path, metadata)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("cannot inspect {}: {error}", path.display()),
+                    ));
+                }
+            }
+        }
+        if !files.is_empty() {
+            return Ok(files);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn validate_rollout_location(codex_home: &Path, thread: &CatalogThread) -> Result<(), String> {
     let root = codex_home.join(if thread.archived {
         "archived_sessions"
     } else {
         "sessions"
     });
-    if !thread.rollout_path.is_absolute() || !thread.rollout_path.starts_with(&root) {
+    if !thread.rollout_path.is_absolute()
+        || !thread.rollout_path.starts_with(&root)
+        || thread
+            .rollout_path
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
         return Err(format!(
             "thread {} rollout path is outside the expected {} tree",
             thread.id,
             root.display()
         ));
     }
-    let metadata = fs::symlink_metadata(&thread.rollout_path).map_err(|error| {
+    Ok(())
+}
+
+fn validate_rollout_path(codex_home: &Path, thread: &CatalogThread) -> Result<u64, String> {
+    validate_rollout_location(codex_home, thread)?;
+    let unavailable = |error: io::Error| {
         format!(
             "thread {} rollout file is unavailable at {}: {error}",
             thread.id,
             thread.rollout_path.display()
         )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "thread {} rollout path is not a regular file: {}",
-            thread.id,
-            thread.rollout_path.display()
-        ));
-    }
+    };
+    let files = regular_rollout_files(&thread.rollout_path).map_err(unavailable)?;
+    // Prefer the plain representation, as Codex does, without decoding either file.
+    let (_, metadata) = files
+        .first()
+        .ok_or_else(|| unavailable(io::Error::from(io::ErrorKind::NotFound)))?;
     Ok(metadata.len())
 }
 
-fn collect_jsonl_paths(root: &Path, recursive: bool) -> Result<BTreeSet<PathBuf>, String> {
+fn collect_rollout_paths(root: &Path, recursive: bool) -> Result<BTreeSet<PathBuf>, String> {
     if !root.exists() {
         return Ok(BTreeSet::new());
     }
@@ -1708,10 +1769,15 @@ fn collect_jsonl_paths(root: &Path, recursive: bool) -> Result<BTreeSet<PathBuf>
             }
             if file_type.is_dir() && recursive {
                 pending.push(entry.path());
-            } else if file_type.is_file()
-                && entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
-            {
-                files.insert(entry.path());
+            } else if file_type.is_file() {
+                let path = entry.path();
+                let plain = rollout_paths(&path)[0].clone();
+                if plain
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
+                {
+                    files.insert(path);
+                }
             }
         }
     }
@@ -1722,12 +1788,12 @@ fn audit_rollout_roots(
     codex_home: &Path,
     catalog: &CatalogSnapshot,
 ) -> Result<(usize, usize, Vec<PathBuf>), String> {
-    let sessions = collect_jsonl_paths(&codex_home.join("sessions"), true)?;
-    let archived = collect_jsonl_paths(&codex_home.join("archived_sessions"), false)?;
+    let sessions = collect_rollout_paths(&codex_home.join("sessions"), true)?;
+    let archived = collect_rollout_paths(&codex_home.join("archived_sessions"), false)?;
     let expected = catalog
         .threads
         .values()
-        .map(|thread| thread.rollout_path.clone())
+        .flat_map(|thread| rollout_paths(&thread.rollout_path))
         .collect::<BTreeSet<_>>();
     let orphaned = sessions
         .union(&archived)
@@ -2010,17 +2076,14 @@ fn discover_maintenance(
         });
     }
     for thread in catalog.threads.values() {
-        let expected_root = codex_home.join(if thread.archived {
-            "archived_sessions"
-        } else {
-            "sessions"
-        });
-        if !thread.rollout_path.is_absolute() || !thread.rollout_path.starts_with(&expected_root) {
+        if validate_rollout_location(codex_home, thread).is_err() {
             continue;
         }
-        match fs::symlink_metadata(&thread.rollout_path) {
+        match regular_rollout_files(&thread.rollout_path) {
+            Ok(files) if files.is_empty() => {}
             Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            // Non-regular paths remain protected, never candidates for record removal.
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => continue,
             Err(error) => {
                 return Err(format!(
                     "cannot inspect {}: {error}",
@@ -2128,7 +2191,15 @@ fn deletion_residue(
     rollout_path: &Path,
 ) -> Result<Vec<String>, String> {
     let mut residue = Vec::new();
-    if fs::symlink_metadata(rollout_path).is_ok() {
+    let mut rollout_remains = false;
+    for path in rollout_paths(rollout_path) {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => rollout_remains = true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+        }
+    }
+    if rollout_remains {
         residue.push("rollout file".into());
     }
     if session_index_contains(codex_home, thread_id)? {
@@ -3056,6 +3127,28 @@ fn cleanup_missing_rollout_thread(
         .strip_prefix("thread:")
         .filter(|value| !value.is_empty())
         .ok_or(VaultError::StalePreview)?;
+    // Recheck after the state backup as well as during candidate discovery: Codex
+    // may compress or materialize this rollout while a cleanup preview is open.
+    let catalog = read_thread_catalog(database).map_err(VaultError::Blocked)?;
+    let thread = catalog
+        .threads
+        .get(thread_id)
+        .ok_or(VaultError::StalePreview)?;
+    validate_rollout_location(codex_home, thread).map_err(VaultError::Blocked)?;
+    if candidate.detail != thread.rollout_path.display().to_string()
+        || candidate.fingerprint
+            != format!(
+                "{}:{}:{}",
+                thread.id,
+                thread.last_activity_ms,
+                thread.rollout_path.display()
+            )
+        || !regular_rollout_files(&thread.rollout_path)
+            .map_err(|error| VaultError::Blocked(error.to_string()))?
+            .is_empty()
+    {
+        return Err(VaultError::StalePreview);
+    }
     let session_index = codex_home.join("session_index.jsonl");
     let index_backup = backup_root.join("index/session_index.jsonl");
     let index_changed = if session_index.is_file() {
@@ -3074,6 +3167,12 @@ fn cleanup_missing_rollout_thread(
         let transaction = connection
             .transaction()
             .map_err(|error| VaultError::Storage(error.to_string()))?;
+        if !regular_rollout_files(&thread.rollout_path)
+            .map_err(|error| VaultError::Blocked(error.to_string()))?
+            .is_empty()
+        {
+            return Err(VaultError::StalePreview);
+        }
         transaction
             .execute(
                 "DELETE FROM thread_attachments WHERE thread_id=?1",
@@ -3093,7 +3192,14 @@ fn cleanup_missing_rollout_thread(
             )
             .map_err(|error| VaultError::Storage(error.to_string()))?;
         let changed = transaction
-            .execute("DELETE FROM threads WHERE id=?1", [thread_id])
+            .execute(
+                "DELETE FROM threads WHERE id=?1 AND rollout_path=?2 AND updated_at_ms=?3",
+                params![
+                    thread_id,
+                    thread.rollout_path.to_string_lossy().as_ref(),
+                    thread.last_activity_ms
+                ],
+            )
             .map_err(|error| VaultError::Storage(error.to_string()))?;
         if changed != 1 {
             return Err(VaultError::StalePreview);
@@ -3592,6 +3698,190 @@ mod tests {
     }
 
     #[test]
+    fn compressed_rollouts_remain_owned_in_active_and_archived_catalogs() {
+        for archived in [false, true] {
+            for catalog_compressed in [false, true] {
+                let home = tempfile::tempdir().unwrap();
+                let directory = if archived {
+                    "archived_sessions"
+                } else {
+                    "sessions/2026/11/04"
+                };
+                let plain = home.path().join(directory).join("rollout-root.jsonl");
+                let compressed = rollout_paths(&plain)[1].clone();
+                fs::create_dir_all(plain.parent().unwrap()).unwrap();
+                let opaque_bytes = b"\x28\xb5\x2f\xfdopaque-compressed-history";
+                fs::write(&compressed, opaque_bytes).unwrap();
+                // Temporary compression output must never become a cleanup candidate.
+                fs::write(plain.with_extension("jsonl.zst.tmp"), b"temporary").unwrap();
+                let stored_path = if catalog_compressed {
+                    &compressed
+                } else {
+                    &plain
+                };
+                let database = home.path().join("state_5.sqlite");
+                create_catalog_database(&database, stored_path);
+                Connection::open(&database)
+                    .unwrap()
+                    .execute("UPDATE threads SET archived=?1", [archived])
+                    .unwrap();
+                let catalog = read_thread_catalog(&database).unwrap();
+                assert_eq!(
+                    validate_rollout_path(home.path(), &catalog.threads["root"]),
+                    Ok(opaque_bytes.len() as u64)
+                );
+                let discovery = discover_maintenance(home.path(), &database, &catalog).unwrap();
+                assert!(discovery.candidates.is_empty());
+                assert_eq!(
+                    (discovery.active_rollouts, discovery.archived_rollouts),
+                    if archived { (0, 1) } else { (1, 0) }
+                );
+
+                fs::write(&plain, b"plain history").unwrap();
+                assert_eq!(
+                    validate_rollout_path(home.path(), &catalog.threads["root"]),
+                    Ok(13)
+                );
+                // Both physical forms are owned, even when the catalog names the ZST.
+                let discovery = discover_maintenance(home.path(), &database, &catalog).unwrap();
+                assert!(discovery.candidates.is_empty());
+                assert_eq!(
+                    (discovery.active_rollouts, discovery.archived_rollouts),
+                    if archived { (0, 2) } else { (2, 0) }
+                );
+                assert_eq!(fs::read(&compressed).unwrap(), opaque_bytes);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compressed_rollout_symlinks_and_non_files_remain_protected() {
+        let home = tempfile::tempdir().unwrap();
+        let plain = home.path().join("sessions/rollout-root.jsonl");
+        let compressed = rollout_paths(&plain)[1].clone();
+        fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        let database = home.path().join("state_5.sqlite");
+        create_catalog_database(&database, &plain);
+        let mut catalog = read_thread_catalog(&database).unwrap();
+        let outside = home.path().join("unowned-history");
+        fs::write(&outside, b"history").unwrap();
+        std::os::unix::fs::symlink(&outside, &compressed).unwrap();
+        assert!(validate_rollout_path(home.path(), &catalog.threads["root"]).is_err());
+        assert!(
+            discover_maintenance(home.path(), &database, &catalog)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        fs::remove_file(&compressed).unwrap();
+        fs::create_dir(&compressed).unwrap();
+        assert!(validate_rollout_path(home.path(), &catalog.threads["root"]).is_err());
+        assert!(
+            discover_maintenance(home.path(), &database, &catalog)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        fs::remove_dir(&compressed).unwrap();
+        fs::write(&compressed, b"compressed history").unwrap();
+        std::os::unix::fs::symlink(&outside, &plain).unwrap();
+        // A safe compressed sibling must not hide an unsafe plain path.
+        assert!(validate_rollout_path(home.path(), &catalog.threads["root"]).is_err());
+        assert!(
+            discover_maintenance(home.path(), &database, &catalog)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        catalog.threads.get_mut("root").unwrap().rollout_path =
+            home.path().join("sessions/../unowned-history");
+        assert!(validate_rollout_path(home.path(), &catalog.threads["root"]).is_err());
+    }
+
+    #[test]
+    fn compressed_orphans_are_backed_up_without_decoding() {
+        let home = tempfile::tempdir().unwrap();
+        let rollout = home.path().join("sessions/rollout-root.jsonl");
+        let orphan = home.path().join("sessions/orphan.jsonl.zst");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(&rollout, b"current").unwrap();
+        let bytes = b"\x28\xb5\x2f\xfdopaque-orphan";
+        fs::write(&orphan, bytes).unwrap();
+        let database = home.path().join("state_5.sqlite");
+        create_catalog_database(&database, &rollout);
+        let catalog = read_thread_catalog(&database).unwrap();
+        let discovery = discover_maintenance(home.path(), &database, &catalog).unwrap();
+        assert_eq!(discovery.candidates.len(), 1);
+        let candidate = &discovery.candidates[0];
+        assert_eq!(candidate.kind, MaintenanceKind::UnreferencedRollout);
+        assert_eq!(candidate.bytes, bytes.len() as u64);
+        let backup = home.path().join("codex-vault-backups/compressed");
+        cleanup_unreferenced_rollout(home.path(), &backup, candidate).unwrap();
+        assert!(!orphan.exists());
+        assert_eq!(
+            fs::read(backup.join("rollouts/sessions/orphan.jsonl.zst")).unwrap(),
+            bytes
+        );
+        assert!(rollout.is_file());
+    }
+
+    #[test]
+    fn missing_rollout_cleanup_rejects_reappearing_plain_or_compressed_history() {
+        for compressed in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let plain = home.path().join("sessions/rollout-root.jsonl");
+            fs::create_dir_all(plain.parent().unwrap()).unwrap();
+            let database = home.path().join("state_5.sqlite");
+            create_catalog_database(&database, &plain);
+            let index = home.path().join("session_index.jsonl");
+            let index_bytes = b"{\"id\":\"root\"}\n";
+            fs::write(&index, index_bytes).unwrap();
+            let catalog = read_thread_catalog(&database).unwrap();
+            let discovery = discover_maintenance(home.path(), &database, &catalog).unwrap();
+            let candidate = discovery
+                .candidates
+                .iter()
+                .find(|candidate| candidate.key == "thread:root")
+                .unwrap();
+            let appeared = rollout_paths(&plain)[usize::from(compressed)].clone();
+            fs::write(&appeared, b"recovered history").unwrap();
+            let backup = home.path().join("codex-vault-backups/stale");
+            backup_sqlite_database(&database, &backup).unwrap();
+            assert!(matches!(
+                cleanup_missing_rollout_thread(home.path(), &database, &backup, candidate),
+                Err(VaultError::StalePreview)
+            ));
+            assert_eq!(read_thread_catalog(&database).unwrap().threads.len(), 2);
+            assert_eq!(fs::read(&index).unwrap(), index_bytes);
+            assert!(appeared.is_file());
+        }
+    }
+
+    #[test]
+    fn compression_invalidates_an_orphan_cleanup_preview() {
+        let home = tempfile::tempdir().unwrap();
+        let rollout = home.path().join("sessions/rollout-root.jsonl");
+        let orphan = home.path().join("sessions/orphan.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(&rollout, b"current").unwrap();
+        fs::write(&orphan, b"orphan history").unwrap();
+        let database = home.path().join("state_5.sqlite");
+        create_catalog_database(&database, &rollout);
+        let catalog = read_thread_catalog(&database).unwrap();
+        let discovery = discover_maintenance(home.path(), &database, &catalog).unwrap();
+        let candidate = &discovery.candidates[0];
+        let compressed = rollout_paths(&orphan)[1].clone();
+        fs::rename(&orphan, &compressed).unwrap();
+        let backup = home.path().join("codex-vault-backups/stale");
+        assert!(cleanup_unreferenced_rollout(home.path(), &backup, candidate).is_err());
+        assert!(compressed.is_file());
+        let discovery = discover_maintenance(home.path(), &database, &catalog).unwrap();
+        assert_eq!(discovery.candidates.len(), 1);
+        assert_ne!(candidate.key, discovery.candidates[0].key);
+    }
+
+    #[test]
     fn maintenance_discovery_classifies_only_proven_stale_data() {
         let home = tempfile::tempdir().unwrap();
         let rollout = home.path().join("sessions/2026/09/22/rollout-root.jsonl");
@@ -3954,6 +4244,15 @@ mod tests {
         fs::remove_file(&rollout).unwrap();
         fs::write(home.path().join("session_index.jsonl"), b"").unwrap();
 
+        let compressed = rollout_paths(&rollout)[1].clone();
+        fs::write(&compressed, b"compressed residue").unwrap();
+        for stored_path in [&rollout, &compressed] {
+            assert_eq!(
+                deletion_residue(home.path(), home.path(), &state, "root", stored_path).unwrap(),
+                vec!["rollout file"]
+            );
+        }
+        fs::remove_file(&compressed).unwrap();
         assert!(
             deletion_residue(home.path(), home.path(), &state, "root", &rollout)
                 .unwrap()
